@@ -310,6 +310,28 @@ def calc_physics_residual(pred_tensor_norm, kappa, stats_mean, stats_std,
         return loss_mono + loss_smooth + loss_tail
 
 
+    # ================================================================
+    #   ★ 约束 8.5：能量范围惩罚（核束缚态物理合理性）
+    #
+    #   物理依据：核子单粒子能量通常在 [-80, +50] MeV 范围
+    #     - 深束缚态 (1s₁/₂): ~ -35 ~ -80 MeV（重核更深）
+    #     - 浅束缚态: ~ -5 ~ +10 MeV
+    #     - 连续态: ~ 0 ~ +50 MeV
+    #
+    #   策略：软边界惩罚
+    #     E ∈ [-80, +50]: 无惩罚（正常范围）
+    #     E < -80 或 E > +50: 施加二次惩罚，偏离越远罚越重
+    # ================================================================
+    E_min, E_max = -80.0, 50.0  # 正常能量范围 (MeV)
+    E_scalar = E.squeeze(-1)  # (B,)
+
+    # 低于下限：E < -80（过深的非物理束缚）
+    below_low = torch.clamp(E_min - E_scalar, min=0.0)
+    # 高于上限：E > -50（过浅或正值=非束缚态）
+    above_high = torch.clamp(E_scalar - E_max, min=0.0)
+
+    loss_energy_range = torch.mean((below_low ** 2 + above_high ** 2)) * 0.01
+
     loss_shape = _waveform_shape_penalty(g, f, r, dr)
 
     # ================================================================
@@ -528,6 +550,7 @@ def calc_physics_residual(pred_tensor_norm, kappa, stats_mean, stats_std,
             'loss_boundary': loss_boundary_total,       # ★ 原始边界 + 新增平滑性保护
             'loss_positive_energy': loss_positive_energy,
             'loss_kinetic_positive': loss_kinetic_positive,
+            'loss_energy_range': loss_energy_range,      # ★ 新增：能量范围惩罚 (-80~-50 MeV)
             'loss_shape': loss_shape,                    # ★ 新增：波形形态惩罚
             'loss_boundary_smooth': loss_boundary_smooth,# ★ 新增：边界平滑性（可单独监控）
             'norm_integral': norm_integral.detach().mean(),
@@ -536,7 +559,8 @@ def calc_physics_residual(pred_tensor_norm, kappa, stats_mean, stats_std,
             'vms_core': vms_core,                         # ★ 新增：矢量势场核内均值
             'loss_total': (loss_pde + loss_norm + loss_amplitude + loss_node_anomaly
                            + loss_boundary_total + loss_positive_energy
-                           + loss_kinetic_positive + loss_shape),
+                           + loss_kinetic_positive + loss_energy_range
+                           + loss_shape),
         }
         if ref_scale is not None and ref_scale > 0:
             # ★ PDE/Norm 不做任何缩放！原始值直接输出
@@ -546,6 +570,7 @@ def calc_physics_residual(pred_tensor_norm, kappa, stats_mean, stats_std,
                 'loss_amplitude': loss_amplitude / ref_scale,
                 'loss_node': loss_node_anomaly,
                 'loss_boundary': loss_boundary_total,
+                'loss_energy_range': loss_energy_range,      # ★ 新增
                 'loss_shape': loss_shape / ref_scale,
                 'loss_boundary_smooth': loss_boundary_smooth / ref_scale,
                 'loss_positive_energy': loss_positive_energy,
@@ -558,6 +583,7 @@ def calc_physics_residual(pred_tensor_norm, kappa, stats_mean, stats_std,
             scaled['loss_total'] = (scaled['loss_pde'] + scaled['loss_norm']
                                     + scaled['loss_amplitude'] + scaled['loss_node']
                                     + scaled['loss_boundary']
+                                    + scaled['loss_energy_range']
                                     + scaled['loss_shape']
                                     + scaled['loss_positive_energy']
                                     + scaled['loss_kinetic_positive'])

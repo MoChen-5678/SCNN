@@ -342,6 +342,7 @@ def train_model():
     lambda_sign = 5.0        # ★ 已删除，替代为能量约束
     lambda_boundary = 3.0    # 边界衰减约束
     lambda_energy = 10.0     # ★ 正能量约束（标量密度 > 0）
+    lambda_energy_range = 5.0 # ★ 能量范围惩罚 (-80 ~ +50 MeV)
     lambda_kinetic = 15.0    # ★ 动能正定性（防负能量海）
     lambda_shape = 8.0       # ★ 波形形态惩罚（高斯波包相似度，防偷懒）
     lambda_bsmooth = 5.0     # ★ 边界平滑性保护（反震荡）
@@ -491,7 +492,7 @@ def train_model():
             writer = csv.writer(f)
             writer.writerow(['epoch', 'phase', 'total_loss', 'loss_data', 'loss_pde', 'loss_norm',
                            'loss_node', 'loss_boundary', 'loss_energy', 'loss_kinetic',
-                           'loss_shape', 'loss_bsmooth', 'energy_pred', 'vps_core',
+                           'loss_energy_range', 'loss_shape', 'loss_bsmooth', 'energy_pred', 'vps_core',
                            'learning_rate', 'best_epoch', 'active_isotopes'])
 
     best_data_loss = float('inf')
@@ -574,6 +575,7 @@ def train_model():
         total_loss_kinetic = 0.0
         total_loss_shape = 0.0
         total_loss_bsmooth = 0.0
+    total_loss_energy_range = 0.0
         num_batches = 0
 
         optimizer.zero_grad(set_to_none=True)
@@ -636,6 +638,7 @@ def train_model():
                         loss_kinetic = phy_components.get('loss_kinetic_positive', torch.tensor(0.0, device=device))
                         loss_shape = phy_components.get('loss_shape', torch.tensor(0.0, device=device))       # ★
                         loss_bsmooth = phy_components.get('loss_boundary_smooth', torch.tensor(0.0, device=device))  # ★
+                        loss_energy_range = phy_components.get('loss_energy_range', torch.tensor(0.0, device=device))  # ★ 能量范围
                     else:
                         phy_components = calc_physics_residual(
                             pred_tensor_norm=y_pred_norm,
@@ -655,6 +658,7 @@ def train_model():
                         loss_kinetic = phy_components.get('loss_kinetic_positive', torch.tensor(0.0, device=device))
                         loss_shape = phy_components.get('loss_shape', torch.tensor(0.0, device=device))       # ★
                         loss_bsmooth = phy_components.get('loss_boundary_smooth', torch.tensor(0.0, device=device))  # ★
+                        loss_energy_range = phy_components.get('loss_energy_range', torch.tensor(0.0, device=device))  # ★ 能量范围
 
                     # ★ 物理主导损失组合: PDE > Norm > Node > Energy/Kinetic > Shape/Boundary >> Data(MSE辅助)
                     loss_phy = (lambda_pde * loss_pde +          # ★ PDE 主导！狄拉克方程残差
@@ -662,6 +666,7 @@ def train_model():
                                 lambda_node * loss_node +        # 节点数精确约束
                                 lambda_energy * loss_energy +    # ★ 正能量约束（标量密度>0）
                                 lambda_kinetic * loss_kinetic +  # ★ 动能正定性（防负能量海）
+                                lambda_energy_range * loss_energy_range +  # ★ 能量范围 (-80~+50 MeV)
                                 lambda_boundary * loss_boundary + # 边界端点约束
                                 lambda_shape * loss_shape +       # ★ 波形形态惩罚（防偷懒）
                                 lambda_bsmooth * loss_bsmooth)   # ★ 边界平滑性（反震荡）
@@ -674,6 +679,7 @@ def train_model():
                     loss_kinetic = torch.tensor(0.0, device=device)
                     loss_shape = torch.tensor(0.0, device=device)       # ★
                     loss_bsmooth = torch.tensor(0.0, device=device)    # ★
+                    loss_energy_range = torch.tensor(0.0, device=device)  # ★ 能量范围
                     loss_phy = torch.tensor(0.0, device=device)
 
                 # ★ 总损失 = 弱MSE辅助 + 强物理主导
@@ -707,6 +713,7 @@ def train_model():
             total_loss_kinetic += (loss_kinetic.item() * grad_accum_steps) if isinstance(loss_kinetic, torch.Tensor) and loss_kinetic.requires_grad else 0.0
             total_loss_shape += (loss_shape.item() * grad_accum_steps) if isinstance(loss_shape, torch.Tensor) and loss_shape.requires_grad else 0.0
             total_loss_bsmooth += (loss_bsmooth.item() * grad_accum_steps) if isinstance(loss_bsmooth, torch.Tensor) and loss_bsmooth.requires_grad else 0.0
+            total_loss_energy_range += (loss_energy_range.item() * grad_accum_steps) if isinstance(loss_energy_range, torch.Tensor) and loss_energy_range.requires_grad else 0.0
             num_batches += 1
 
         # LR调度
@@ -739,6 +746,7 @@ def train_model():
         loss_kinetic_avg = total_loss_kinetic / n_batches
         loss_shape_avg = total_loss_shape / n_batches       # ★
         loss_bsmooth_avg = total_loss_bsmooth / n_batches   # ★
+        loss_energy_range_avg = total_loss_energy_range / n_batches  # ★ 能量范围
 
         # Early Stopping
         current_data_loss = loss_data_avg
@@ -777,6 +785,7 @@ def train_model():
                     f"{loss_pde_avg:.6f}", f"{loss_norm_avg:.6f}",
                     f"{loss_node_avg:.6f}", f"{loss_boundary_avg:.6f}",
                     f"{loss_energy_avg:.8f}", f"{loss_kinetic_avg:.8f}",
+                    f"{loss_energy_range_avg:.8f}",
                     f"{loss_shape_avg:.6f}", f"{loss_bsmooth_avg:.6f}",
                     f"{energy_pred_val:.4f}", f"{vps_core_val:.4f}",
                     f"{current_lr:.2e}",
@@ -787,7 +796,8 @@ def train_model():
                 phase_names = {1: "双幻核预热", 2: "多体耦合", 3: "极小值寻优"}
                 print(f"Epoch [{epoch:3d}/{num_epochs}] | Phase{current_phase}({phase_names[current_phase]}) | LR: {current_lr:.2e}", flush=True)
                 print(f"  [物理主导] Loss: {loss_total_avg:.4f} | Data: {loss_data_avg:.4f}(×{lambda_data}) | PDE: {loss_pde_avg:.4f}(×{lambda_pde}) | Norm: {loss_norm_avg:.4f}(×{lambda_norm}) | Node: {loss_node_avg:.4f}(×{lambda_node})", flush=True)
-                print(f"             Energy: {loss_energy_avg:.6f}(×{lambda_energy}) | Kinetic: {loss_kinetic_avg:.6f}(×{lambda_kinetic}) | Boundary: {loss_boundary_avg:.6f}(×{lambda_boundary}) | Shape: {loss_shape_avg:.6f}(×{lambda_shape}) | BSmooth: {loss_bsmooth_avg:.6f}(×{lambda_bsmooth})", flush=True)
+                print(f"             Energy: {loss_energy_avg:.6f}(×{lambda_energy}) | Kinetic: {loss_kinetic_avg:.6f}(×{lambda_kinetic}) | E_Range: {loss_energy_range_avg:.6f}(×{lambda_energy_range}) | Boundary: {loss_boundary_avg:.6f}(×{lambda_boundary})", flush=True)
+                print(f"             Shape: {loss_shape_avg:.6f}(×{lambda_shape}) | BSmooth: {loss_bsmooth_avg:.6f}(×{lambda_bsmooth})", flush=True)
                 print(f"             ★ E_pred={energy_pred_val:.2f} MeV | vps_core={vps_core_val:.2f}", flush=True)
 
             # 物理验证
