@@ -281,6 +281,12 @@ class RHF_FNO_GRU(nn.Module):
         self.decoder_fc = nn.Linear(gru_hidden, self.gru_input_size)
         self.output_conv = nn.Conv1d(hidden_dim, self.physics_channels, 1)
 
+        # ★ 其余通道(2-10)的输出缩放层
+        # 网络原始输出量级不确定，需要一个可学习的缩放使其落到物理空间
+        # 使用 xavier 初始化，缩放因子初始≈1.0，偏置≈0.0
+        self.other_scale = nn.Parameter(torch.ones(9))  # 9个通道的缩放因子
+        self.other_bias = nn.Parameter(torch.zeros(9))   # 9个通道的偏移
+
         # 指数衰减系数网络 (预测 alpha 以施加无穷远边界约束)
         self.alpha_net = nn.Sequential(
             nn.Linear(gru_hidden, 64),
@@ -523,8 +529,12 @@ class RHF_FNO_GRU(nn.Module):
         g_ansatz = g_normalized.unsqueeze(1)
         f_ansatz = f_normalized.unsqueeze(1)
 
-        # 剩余9个物理场通道
-        other_fields = pred_x[:, 2:, :]
+        # 剩余9个物理场通道 — ★ 应用可学习缩放映射到物理空间
+        other_fields = pred_x[:, 2:, :]  # (B, 9, N)
+        # 逐通道缩放: pred_ch * scale_ch + bias_ch
+        scale = self.other_scale.view(1, 9, 1)
+        bias = self.other_bias.view(1, 9, 1)
+        other_fields = other_fields * scale + bias
 
         # 拼接最终输出
         final_pred_x = torch.cat([g_ansatz, f_ansatz, other_fields], dim=1)

@@ -4,7 +4,7 @@ import torch
 _ref_scale = None
 
 
-def calc_physics_residual(pred_tensor_norm, kappa, stats_mean, stats_std,
+def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
                           dr=0.10, ref_scale=None, return_components=True,
                           n_principal=None):
     """
@@ -14,9 +14,9 @@ def calc_physics_residual(pred_tensor_norm, kappa, stats_mean, stats_std,
 
     参数：
     ------
-    pred_tensor_norm: 网络输出的归一化预测值 (B, 11, N)
+    pred_tensor: 网络输出的物理空间预测值 (B, 11, N) — 全部在物理空间，无需反归一化
     kappa: (B,) κ量子数
-    stats_mean, stats_std: 对应 11 个通道的统计均值和标准差 (11,)
+    stats_mean, stats_std: 保留接口兼容，但不再用于反归一化
     dr: 径向网格间距（默认0.10 fm）
     ref_scale: 物理损失参考尺度（用于归一化，None则不缩放）
     return_components: True返回dict，False返回标量
@@ -29,13 +29,10 @@ def calc_physics_residual(pred_tensor_norm, kappa, stats_mean, stats_std,
     return_components=False:
         标量总物理损失
     """
-    device = pred_tensor_norm.device
-    B, C, npt = pred_tensor_norm.shape
+    device = pred_tensor.device
+    B, C, npt = pred_tensor.shape
 
-    # 1. 严格的反归一化 (重建物理量纲)
-    mean_T = stats_mean.view(1, C, 1).to(device)
-    std_T = stats_std.view(1, C, 1).to(device)
-    pred_tensor = pred_tensor_norm * std_T + mean_T
+    # ★ 模型输出已在物理空间，直接使用，无需反归一化
 
     # 2. 通道解包 (处于真实物理量纲 fm 或 MeV)
     g = pred_tensor[:, 0, :]

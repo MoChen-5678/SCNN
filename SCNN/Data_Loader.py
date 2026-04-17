@@ -548,9 +548,6 @@ def _parse_single_step(wav_path, pot_path):
     wav_data = np.loadtxt(wav_path, comments='#', converters={1: _fix_fortran_float, 2: _fix_fortran_float})
     g, f = wav_data[:, 1], wav_data[:, 2]
 
-    if np.max(np.abs(g)) > 100.0 or np.max(np.abs(f)) > 100.0:
-        return None
-
     npt = len(g)
     r_grid = np.arange(npt) * 0.10
     r_grid[0] = 0.0010
@@ -560,6 +557,10 @@ def _parse_single_step(wav_path, pot_path):
         nf = 1.0 / np.sqrt(norm_integral)
         g, f = g * nf, f * nf
     else:
+        return None
+
+    # ★ 极端值检查移到归一化之后（RHF原始数据量级可达10^9，归一化后才O(1)）
+    if np.max(np.abs(g)) > 50.0 or np.max(np.abs(f)) > 50.0:
         return None
 
     # ★ 统一相位约定：第一个峰（|g|的局部极大值）为正
@@ -597,8 +598,18 @@ if __name__ == "__main__":
     print("=== 数据管道测试（Y=最终收敛态 + ZN元数据 版）===")
 
     test_dir = '/home/ubuntu/rhf/results'
-    targets = ['1s1/2', '1p1/2']
-    isos = ['16O', '40Ca', '86Kr', '210Pb']
+    # ★ 完整的42个核子态（与 Train.py 保持一致）
+    targets = [
+        '1s1/2', '2s1/2', '3s1/2', '4s1/2', '5s1/2', '6s1/2',
+        '1p3/2', '2p3/2', '3p3/2', '4p3/2', '5p3/2', '6p3/2',
+        '1d5/2', '2d5/2', '3d5/2', '4d5/2', '5d5/2',
+        '1f7/2', '2f7/2', '3f7/2', '4f7/2', '5f7/2',
+        '1p1/2', '2p1/2', '3p1/2', '4p1/2', '5p1/2', '6p1/2',
+        '1d3/2', '2d3/2', '3d3/2', '4d3/2', '5d3/2',
+        '1f5/2', '2f5/2', '3f5/2', '4f5/2', '5f5/2',
+        '1g7/2', '2g7/2', '3g7/2', '4g7/2',
+    ]
+    isos = ['16O', '40Ca']
 
     # 测试1：新接口 build_datasets
     print("\n--- 测试 build_datasets (train/val/test 划分) ---")

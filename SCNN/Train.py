@@ -217,10 +217,38 @@ def calculate_normalization_stats(dataloader, local_rank, use_ddp=False):
     return mean, std
 
 
+def calculate_y_stats(dataloader, local_rank, use_ddp=False):
+    """计算Y目标（最终收敛态）的11通道统计量，与X输入统计量分离。"""
+    if local_rank == 0 or not use_ddp:
+        print("正在计算Y目标通道统计信息...")
+
+    sum_y = torch.zeros(11)
+    sum_sq_y = torch.zeros(11)
+    num_y = 0
+
+    for batch_data in dataloader:
+        y_true = batch_data[1]  # (B, 11, N)
+        B, C, N = y_true.shape
+        y_flat = y_true.permute(1, 0, 2).reshape(11, -1)
+        sum_y += y_flat.sum(dim=1)
+        sum_sq_y += (y_flat ** 2).sum(dim=1)
+        num_y += B * N
+
+    y_mean = sum_y / num_y
+    y_std = torch.sqrt(sum_sq_y / num_y - y_mean ** 2)
+    y_std = torch.clamp(y_std, min=1e-8)
+
+    if local_rank == 0 or not use_ddp:
+        print("Y通道均值:", y_mean.numpy())
+        print("Y通道标准差:", y_std.numpy())
+    return y_mean, y_std
+
+
 def normalize(tensor, mean, std):
-    """归一化张量，只处理前11个物理通道，第12维(progress)原样保留。"""
-    mean_view = mean.view(1, 11, 1).to(tensor.device)
-    std_view = std.view(1, 11, 1).to(tensor.device)
+    """归一化张量，根据 mean/std 的实际通道数自适应。"""
+    C = len(mean)
+    mean_view = mean.view(1, C, 1).to(tensor.device)
+    std_view = std.view(1, C, 1).to(tensor.device)
     if len(tensor.shape) == 4:
         mean_view = mean_view.unsqueeze(1)
         std_view = std_view.unsqueeze(1)
@@ -236,8 +264,8 @@ def normalize(tensor, mean, std):
         return tensor
 
 
-def _evaluate(model, dataloader, device, stats_mean, stats_std, base_r_grid,
-              criterion, use_ddp):
+def _evaluate(model, dataloader, device, stats_mean, stats_std, y_mean, y_std,
+              base_r_grid, criterion, use_ddp):
     """在验证集或测试集上评估模型"""
     model.eval()
     total_loss = 0.0
@@ -254,25 +282,30 @@ def _evaluate(model, dataloader, device, stats_mean, stats_std, base_r_grid,
         is_proton = batch_data[3].to(device) if len(batch_data) > 3 else None
         z_num = batch_data[5].to(device) if len(batch_data) > 5 else None
         n_num = batch_data[6].to(device) if len(batch_data) > 6 else None
-        n_principal = batch_data[7].to(device) if len(batch_data) > 7 else None  # ★ 主量子数
+        n_principal = batch_data[7].to(device) if len(batch_data) > 7 else None
 
         B = x_batch.size(0)
         batch_r_grid = base_r_grid.unsqueeze(0).expand(B, -1)
 
         x_norm = normalize(x_batch, stats_mean, stats_std)
-        y_norm = normalize(y_true, stats_mean, stats_std)
 
         with torch.no_grad():
-            y_pred_norm = model(x_norm, kappa_true, batch_r_grid,
-                                is_proton=is_proton, z_num=z_num, n_num=n_num,
-                                n_principal=n_principal)  # ★ 传入主量子数
+            y_pred = model(x_norm, kappa_true, batch_r_grid,
+                            is_proton=is_proton, z_num=z_num, n_num=n_num,
+                            n_principal=n_principal)
 
-            loss_data = criterion(y_pred_norm, y_norm)
+            # ★ 分通道MSE: g/f(0,1)在物理空间, 其余通道用y_stats归一化后
+            loss_gf = nn.functional.mse_loss(y_pred[:, :2, :], y_true[:, :2, :])
+            y_true_others_norm = normalize(y_true[:, 2:, :], y_mean[2:], y_std[2:])
+            y_pred_others_norm = normalize(y_pred[:, 2:, :], y_mean[2:], y_std[2:])
+            loss_others = nn.functional.mse_loss(y_pred_others_norm, y_true_others_norm)
+            loss_data = loss_gf + loss_others
 
             try:
                 phy_comp = calc_physics_residual(
-                    y_pred_norm, kappa_true, stats_mean, stats_std,
-                    dr=0.10, return_components=True
+                    y_pred, kappa_true, y_mean, y_std,
+                    dr=0.10, return_components=True,
+                    n_principal=n_principal
                 )
                 loss_pde_val = phy_comp['loss_pde'].item()
                 loss_norm_val = phy_comp['loss_norm'].item()
@@ -335,10 +368,10 @@ def train_model():
     # lambda_pde:  控制狄拉克方程残差的权重（大→强物理驱动）
     # lambda_norm: 归一化约束权重
     # lambda_node: 节点数精确约束权重
-    lambda_data = 0.05       # MSE 弱辅助（原隐式=1.0）
-    lambda_pde = 10.0        # ★ PDE 主导！（狄拉克方程必须满足）
-    lambda_norm = 5.0        # 归一化强约束
-    lambda_node = 8.0        # 节点数精确硬约束
+    lambda_data = 1.0         # ★ MSE数据拟合权重（恢复数据引导力）
+    lambda_pde = 2.0          # ★ PDE残差权重（降低，避免过度压制数据拟合）
+    lambda_norm = 5.0         # 归一化强约束
+    lambda_node = 8.0         # 节点数精确硬约束
     lambda_sign = 5.0        # ★ 已删除，替代为能量约束
     lambda_boundary = 3.0    # 边界衰减约束
     lambda_energy = 10.0     # ★ 正能量约束（标量密度 > 0）
@@ -352,10 +385,10 @@ def train_model():
     # 阶段2 (Epoch 31-100): 全核素解锁, λ_physics Sigmoid→0.1
     # 阶段3 (Epoch 101-120): Cosine Annealing LR 收尾
     curriculum_phase1_epochs = 30
-    curriculum_phase2_epochs = 100
-    num_epochs = 1000        # 原300，减少60%
-    learning_rate = 1e-4    # 略微提高补偿更少epoch
-    batch_size = 1024       # 增大batch→填满V100 32GB显存
+    curriculum_phase2_epochs = 100  # Phase3从101到300
+    num_epochs = 300          # ★ 减少总epoch（足够收敛）
+    learning_rate = 5e-4     # ★ 提高学习率补偿小batch
+    batch_size = 32          # ★ 匹配小数据量，避免梯度估计不稳定
     grad_accum_steps = 1
     # ★ 物理主导损失权重（已在上方定义）
     clip_grad_norm = 1.5
@@ -379,8 +412,28 @@ def train_model():
         '86Kr', '88Sr', '90Zr', '92Mo',
     ]
 
-    target_states = ['1s1/2', '1p1/2', '1d5/2', '1f7/2', '1p3/2', '2s1/2',
-                     '2p3/2', '2p1/2', '1d3/2', '2d5/2', '1d1/2', '2f7/2']
+    # ══════════════════════════════════════════════════════════
+    #   完整的核子态列表 — 涵盖狄拉克基的所有nlj轨道
+    #   数据格式: 每个核素含 it001(中子N) + it002(质子P), 各42个态
+    # ══════════════════════════════════════════════════════════
+    target_states = [
+        # --- s 轨道 (l=0, κ=-1, j=1/2) ---
+        '1s1/2', '2s1/2', '3s1/2', '4s1/2', '5s1/2', '6s1/2',
+        # --- p3/2 轨道 (l=1, κ=-2, j=3/2) ---
+        '1p3/2', '2p3/2', '3p3/2', '4p3/2', '5p3/2', '6p3/2',
+        # --- d5/2 轨道 (l=2, κ=-3, j=5/2) ---
+        '1d5/2', '2d5/2', '3d5/2', '4d5/2', '5d5/2',
+        # --- f7/2 轨道 (l=3, κ=-4, j=7/2) ---
+        '1f7/2', '2f7/2', '3f7/2', '4f7/2', '5f7/2',
+        # --- p1/2 轨道 (l=1, κ=+1, j=1/2) ---
+        '1p1/2', '2p1/2', '3p1/2', '4p1/2', '5p1/2', '6p1/2',
+        # --- d3/2 轨道 (l=2, κ=+2, j=3/2) ---
+        '1d3/2', '2d3/2', '3d3/2', '4d3/2', '5d3/2',
+        # --- f5/2 轨道 (l=3, κ=+3, j=5/2) ---
+        '1f5/2', '2f5/2', '3f5/2', '4f5/2', '5f5/2',
+        # --- g7/2 轨道 (l=4, κ=-4, j=7/2) ---
+        '1g7/2', '2g7/2', '3g7/2', '4g7/2',
+    ]  # 共 6+6+5+5+6+5+5+4 = 42 个态 × 2粒子(N+P) = 84 个轨道
 
     # --- 固定参数 ---
     data_dir = '/home/ubuntu/rhf/results'
@@ -461,6 +514,7 @@ def train_model():
 
     # 统计量
     mean, std = calculate_normalization_stats(train_loader, local_rank, use_ddp=use_ddp)
+    y_mean, y_std = calculate_y_stats(train_loader, local_rank, use_ddp=use_ddp)
 
     # 3. 实例化模型
     if is_main:
@@ -543,6 +597,7 @@ def train_model():
                 train_loader = make_loader(train_dataset, batch_size, shuffle=True)
                 # 重新计算统计量
                 mean, std = calculate_normalization_stats(train_loader, local_rank, use_ddp=use_ddp)
+                y_mean, y_std = calculate_y_stats(train_loader, local_rank, use_ddp=use_ddp)
 
         if use_ddp and hasattr(train_loader, 'sampler') and isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
@@ -575,7 +630,7 @@ def train_model():
         total_loss_kinetic = 0.0
         total_loss_shape = 0.0
         total_loss_bsmooth = 0.0
-    total_loss_energy_range = 0.0
+        total_loss_energy_range = 0.0
         num_batches = 0
 
         optimizer.zero_grad(set_to_none=True)
@@ -598,24 +653,30 @@ def train_model():
             batch_r_grid = base_r_grid.unsqueeze(0).expand(B, -1)
 
             x_seq_norm = normalize(x_seq, mean, std)
-            y_true_norm = normalize(y_true, mean, std)
+            # ★ Y不再用X的stats归一化！g/f通道在物理空间计算MSE，其余通道用Y自己的stats
 
             with autocast('cuda'):
-                y_pred_norm = model(x_seq_norm, kappa, batch_r_grid,
+                y_pred = model(x_seq_norm, kappa, batch_r_grid,
                                     is_proton=is_proton, z_num=z_num, n_num=n_num,
                                     n_principal=n_principal)  # ★ 传入主量子数
 
-                # MSE 数据损失
-                loss_data = mse_criterion(y_pred_norm, y_true_norm)
+                # ★ 分通道MSE计算：
+                # g/f通道(0,1): 模型输出已是物理空间值(硬归一化后), 直接与Y_true物理值比较
+                loss_gf = nn.functional.mse_loss(y_pred[:, :2, :], y_true[:, :2, :])
+                # 其余通道(2-10): 用Y的stats归一化后做MSE
+                y_true_others_norm = normalize(y_true[:, 2:, :], y_mean[2:], y_std[2:])
+                y_pred_others_norm = normalize(y_pred[:, 2:, :], y_mean[2:], y_std[2:])
+                loss_others = nn.functional.mse_loss(y_pred_others_norm, y_true_others_norm)
+                loss_data = loss_gf + loss_others
 
                 # 物理损失（频率控制加速）
                 if compute_physics:
                     if not hasattr(model, '_phy_ref_scale'):
                         phy_components = calc_physics_residual(
-                            pred_tensor_norm=y_pred_norm,
+                            pred_tensor=y_pred,
                             kappa=kappa,
-                            stats_mean=mean,
-                            stats_std=std,
+                            stats_mean=y_mean,
+                            stats_std=y_std,
                             dr=dr,
                             ref_scale=None,
                             return_components=True,
@@ -641,10 +702,10 @@ def train_model():
                         loss_energy_range = phy_components.get('loss_energy_range', torch.tensor(0.0, device=device))  # ★ 能量范围
                     else:
                         phy_components = calc_physics_residual(
-                            pred_tensor_norm=y_pred_norm,
+                            pred_tensor=y_pred,
                             kappa=kappa,
-                            stats_mean=mean,
-                            stats_std=std,
+                            stats_mean=y_mean,
+                            stats_std=y_std,
                             dr=dr,
                             ref_scale=model._phy_ref_scale,
                             return_components=True,
@@ -769,7 +830,7 @@ def train_model():
                                         is_proton=is_proton, z_num=z_num, n_num=n_num,
                                         n_principal=n_principal)
                     phy_diag = calc_physics_residual(
-                        sample_y_ph, kappa, mean, std,
+                        sample_y_ph, kappa, y_mean, y_std,
                         dr=dr, return_components=True, n_principal=n_principal
                     )
                     energy_pred_val = phy_diag.get('energy_E', 0.0).item() if 'energy_E' in phy_diag else 0.0
@@ -808,14 +869,14 @@ def train_model():
                                          n_principal=n_principal)  # ★ 传入主量子数
                     norm_vals, is_norm = verify_normalization(
                         sample_y_pred, batch_r_grid, kappa, dr=dr,
-                        stats_mean=mean, stats_std=std
+                        stats_mean=y_mean, stats_std=y_std
                     )
                     print(f"  [Physics] Norm integral: {norm_vals.mean().item():.6f} | Valid: {is_norm}", flush=True)
 
                     # 绘图（传入真实物理值的Y_true和统计量以做反归一化）
                     plot_path = plot_wavefunctions(
                         sample_y_pred, y_true, batch_r_grid, kappa,
-                        epoch, plot_dir, stats_mean=mean, stats_std=std,
+                        epoch, plot_dir, stats_mean=y_mean, stats_std=y_std,
                         is_proton=is_proton, n_principal=n_principal  # ★ 传入主量子数
                     )
                     if plot_path:
@@ -832,8 +893,8 @@ def train_model():
             # 验证集
             if val_loader is not None and (epoch % 10 == 0 or epoch == 1):
                 with torch.no_grad():
-                    val_metrics = _evaluate(model, val_loader, device, mean, std, base_r_grid,
-                                            mse_criterion, use_ddp)
+                    val_metrics = _evaluate(model, val_loader, device, mean, std, y_mean, y_std,
+                                            base_r_grid, mse_criterion, use_ddp)
                     print(f"  [Val] Loss={val_metrics['total']:.6f} | Data={val_metrics['loss_data']:.6f} | "
                           f"PDE={val_metrics.get('pde',0):.4f} | Norm={val_metrics.get('norm',0):.4f}", flush=True)
 
@@ -847,7 +908,7 @@ def train_model():
             model_to_eval.eval()
 
             with torch.no_grad():
-                test_metrics = _evaluate(model_to_eval, test_loader, device, mean, std,
+                test_metrics = _evaluate(model_to_eval, test_loader, device, mean, std, y_mean, y_std,
                                          base_r_grid, mse_criterion, use_ddp=False)
                 print(f"\n  📊 测试结果:")
                 print(f"     Total Loss:     {test_metrics['total']:.6f}")
