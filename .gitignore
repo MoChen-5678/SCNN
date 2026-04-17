@@ -1,0 +1,25 @@
+# 结果数据
+results/
+
+# Python 编译文件
+*.pyc
+__pycache__/
+
+# 日志文件
+*.log
+train_log.txt
+tune_log.txt
+
+# 模型检查点
+checkpoints/
+training_logs/
+
+# 图片输出
+plots/*.png
+
+# PDF 文件
+*.pdf
+
+# IDE 配置
+.vscode/
+.idea/
