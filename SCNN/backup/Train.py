@@ -17,8 +17,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from Model_Architecture import RHF_FNO_GRU
-from Physics_Informed_Loss import calc_physics_residual, calc_simplified_residual, RHFConsistencyChecker
-from Data_Loader import build_datasets, get_zn, ISOTOPE_ZN, ALL_ISOTOPES, scan_available_isotopes, IsotopeGroupedBatchSampler
+from Physics_Informed_Loss import calc_physics_residual
+from Data_Loader import build_datasets, get_zn, ISOTOPE_ZN
 
 def setup_ddp():
     dist.init_process_group(backend="nccl")
@@ -354,7 +354,7 @@ def train_model():
     torch.backends.cudnn.deterministic = False
 
     # ================================================================
-    #   全局超参数面板 — V2 全轨道自注意力版
+    #   全局超参数面板
     # ================================================================
 
     # --- 模型结构超参数 ---
@@ -362,50 +362,78 @@ def train_model():
     gru_hidden = 1536
     modes = 40
     weight_decay = 1e-4
-    use_self_attention = True  # ★ 启用轨道自注意力
 
-    # --- ★ 精简物理损失权重（6个核心损失）---
-    lambda_data = 0.5         # MSE数据拟合权重（辅助）
-    lambda_pde = 5.0          # Dirac方程残差（主导）
+    # --- ★ 物理主导损失权重 ---
+    # 核心策略: PDE残差是优化主驱动力，MSE仅作为辅助引导
+    # lambda_data: 控制MSE数据拟合的权重（小→弱数据约束）
+    # lambda_pde:  控制狄拉克方程残差的权重（大→强物理驱动）
+    # lambda_norm: 归一化约束权重
+    # lambda_node: 节点数精确约束权重
+    # ★ 优化调整：增强PDE驱动力(2→5)，减弱数据主导(1→0.5)，增强平滑约束(5→20)
+    lambda_data = 0.5         # ★ MSE数据拟合权重（降低，避免数据拟合压制物理约束）
+    lambda_pde = 5.0          # ★ PDE残差权重（增强，更强的物理驱动）
     lambda_norm = 5.0         # 归一化强约束
     lambda_node = 8.0         # 节点数精确硬约束
-    lambda_physical = 10.0    # ★ 合并：正能量态+动能正定性
-    lambda_smooth = 5.0       # ★ 合并：波形光滑性+远场衰减+边界
-    lambda_rayleigh = 8.0     # ★ Rayleigh商能量一致性
-    lambda_consistency = 2.0  # ★ RHF一致性残差权重
+    # lambda_sign: 已删除，替代为正能量约束+能量MSE
+    lambda_boundary = 0.03   # 边界衰减约束
+    lambda_energy = 10.0     # ★ 正能量约束（标量密度 > 0）
+    lambda_energy_range = 5.0 # ★ 能量范围惩罚 (-80 ~ +50 MeV)
+    lambda_kinetic = 15.0    # ★ 动能正定性（防负能量海）
+    lambda_shape = 8.0       # ★ 波形形态惩罚（高斯波包相似度，防偷懒）
+    lambda_bsmooth = 0.5    # ★ 边界平滑性保护（反震荡，从5→20大幅增强）
+    lambda_peak = 10.0       # ★ 峰值位置匹配损失（新增，直接约束峰位置）
+    lambda_energy_mse = 0.5    # ★ 大幅降低：能量应从波函数自然涌现，而非直接回归
+    lambda_energy_rayleigh = 8.0  # ★ 新增：Rayleigh商能量一致性权重（根据教材第3章）
 
-    # ★ f分量MSE加权系数
-    f_mse_weight = 5.0
+    # ★ f分量MSE加权系数（f比g小1-2个量级，需要加权补偿）
+    f_mse_weight = 5.0       # f通道MSE权重（g=1.0, f=5.0）
 
-    # --- 课程学习超参数（全核素版）---
-    # 阶段1 (Epoch 1-300):   轻核预热(7核素), 全轨道
-    # 阶段2 (Epoch 301+):    全部核素+全轨道 + Cosine Annealing
-    curriculum_phase1_epochs = 300
-    num_epochs = 3000
-    learning_rate = 1e-4
-    batch_size = 32
+    # ★ 新增：能量本征值迭代求解参数
+    # 策略：能量不是网络输出，而是通过Rayleigh商从波函数计算
+    # E = <ψ|H|ψ> / <ψ|ψ>，通过迭代修正使PDE残差最小化
+    energy_iteration_steps = 3      # 每batch迭代优化能量次数
+    energy_learning_rate = 0.1      # 能量修正步长
+
+    # --- 课程学习超参数（速度优化版）---
+    # 阶段1 (Epoch 1-500):   仅双幻核(16O+40Ca), 核心态学习 (7态)
+    # 阶段2 (Epoch 501-1200): 全核素解锁, 激发壳层扩展 (21态，需充足过渡)
+    # 阶段3 (Epoch 1201-3700): Cosine Annealing LR 收尾, 全轨道精调 (42态，充分收敛)
+    #
+    # ★ 比例分析：原始(200:400:900≈1:2:4.5)，Phase1放大2.5倍后需同步调整
+    #   Phase2从400→700(+75%)：7态→21态跳跃需要更多epoch过渡防Loss爆炸
+    #   Phase3从900→2500(+178%)：42态Cosine精调是最终收敛关键，不能被压缩
+    curriculum_phase1_epochs = 500     # ★ 前500轮只用双核子(16O+40Ca)充分预热
+    curriculum_phase2_epochs = 1200    # ★ 中等激发态学习（700轮过渡）
+    num_epochs = 3700                  # ★ 总训练3700轮（从1500大幅增加，匹配各阶段比例放大）
+    learning_rate = 1e-4             # ★ 降低学习率（从2e-4降到1e-4，更精细优化）
+    batch_size = 32                  # 匹配小数据量
     grad_accum_steps = 1
+    # ★ 物理主导损失权重（已在上方定义）
     clip_grad_norm = 1.5
 
-    # --- 物理损失频率 ---
-    phy_loss_every_n_batches = 1
+    # --- 物理损失频率：每 N 个 batch 算一次（跳过大部分batch）---
+    phy_loss_every_n_batches = 1  # 数据少，每batch都算物理损失
 
-    # --- 序列长度参数 ---
+    # --- 序列长度参数（放宽以增加样本数）---
     max_seq_len = 15
-    min_seq_len = 2
-    traj_usage_ratio = 0.95
+    min_seq_len = 2        # 原3，降低→更多滑动窗口
+    traj_usage_ratio = 0.95 # 原0.8，提高→更长轨迹利用
 
-    # --- ★ 全核素列表（自动扫描+手动指定）---
-    # 轻核预热组（Phase 1）
-    phase1_isotopes = ['16O', '18O', '20O', '40Ca', '42Ca', '44Ca', '56Ni']
+    # --- 各阶段核素列表 ---
+    # ★ 全部阶段仅使用2个核素(16O+40Ca), 通过态数量渐进扩展防止Loss爆炸
+    phase1_isotopes = ['16O', '40Ca']  # ★ 始终只用这2个核素
+    all_isotopes = phase1_isotopes      # ★ 所有阶段共享，不增加核素
 
-    # ★ 全核素（Phase 2）— 从数据目录自动扫描
-    all_isotopes = scan_available_isotopes(data_dir) if 'data_dir' in dir() else ALL_ISOTOPES
-    if not all_isotopes:
-        all_isotopes = ALL_ISOTOPES  # 回退到预定义列表
-
-    # ★ 全轨道态列表（不再渐进式扩展，Phase1就用全部）
-    ALL_STATES = [
+    # ══════════════════════════════════════════════════════════
+    #   完整的核子态列表 — 涵盖狄拉克基的所有nlj轨道
+    #   数据格式: 每个核素含 it001(中子N) + it002(质子P), 各42个态
+    #
+    #   ★ 渐进式态扩展策略（防Loss爆炸）:
+    #     Phase 1: 仅核心束缚态(8个), 网络先学基本模式
+    #     Phase 2: 中等激发态(24个), 扩展到完整壳层结构
+    #     Phase 3: 全部42个态, 包含高激发连续谱区域
+    # ══════════════════════════════════════════════════════════
+    ALL_42_STATES = [
         '1s1/2', '2s1/2', '3s1/2', '4s1/2', '5s1/2', '6s1/2',
         '1p3/2', '2p3/2', '3p3/2', '4p3/2', '5p3/2', '6p3/2',
         '1d5/2', '2d5/2', '3d5/2', '4d5/2', '5d5/2',
@@ -414,9 +442,30 @@ def train_model():
         '1d3/2', '2d3/2', '3d3/2', '4d3/2', '5d3/2',
         '1f5/2', '2f5/2', '3f5/2', '4f5/2', '5f5/2',
         '1g7/2', '2g7/2', '3g7/2', '4g7/2',
-    ]  # 42个态 × 2粒子(N+P) = 84个轨道
+    ]  # 共 6+6+5+5+6+5+5+4 = 42 个态 × 2粒子(N+P) = 84 个轨道
 
-    target_states = ALL_STATES  # ★ 从Phase1就用全部轨道
+    # ★ 渐进式课程：按物理重要性分批引入态
+    PHASE1_STATES = [
+        # 仅最低能级束缚态 — 核心壳层结构
+        '1s1/2',
+        '1p3/2', '1p1/2',
+        '1d5/2', '1d3/2',
+        '1f7/2', '1f5/2',
+    ]  # 7个态 → 14轨道(含N+P)
+
+    PHASE2_STATES = [
+        # + 第一激发壳层(n=2)
+        '1s1/2', '2s1/2',
+        '1p3/2', '2p3/2', '1p1/2', '2p1/2',
+        '1d5/2', '2d5/2', '1d3/2', '2d3/2',
+        '1f7/2', '2f7/2', '1f5/2', '2f5/2',
+        '1g7/2',
+    ]  # 21个态 → 42轨道
+
+    PHASE3_STATES = ALL_42_STATES  # 全部42个态
+
+    # ★ 初始态列表（Phase 1: 仅核心束缚态）
+    target_states = PHASE1_STATES
 
     # --- 固定参数 ---
     data_dir = '/home/ubuntu/rhf/results'
@@ -428,34 +477,22 @@ def train_model():
     log_dir = '/home/ubuntu/rhf/SCNN/training_logs'
     os.makedirs(log_dir, exist_ok=True)
 
-    log_csv_path = os.path.join(log_dir, 'training_loss_log_v2.csv')
-    rhf_consistency_csv = os.path.join(log_dir, 'rhf_consistency_log.csv')
-
-    # ★ RHF一致性检查器
-    rhf_checker = RHFConsistencyChecker(
-        check_every=100,
-        log_csv=rhf_consistency_csv,
-        lambda_consistency=lambda_consistency
-    )
+    log_csv_path = os.path.join(log_dir, 'training_loss_log.csv')
 
     if is_main:
         effective_batch = batch_size * grad_accum_steps
         print(f"\n   🚀 AMP混合精度: ON")
         print(f"   📦 batch_size={batch_size}, grad_accum={grad_accum_steps} → 等效batch={effective_batch}")
         print(f"   🧠 模型规模: hidden_dim={hidden_dim}, gru_hidden={gru_hidden}, modes={modes}")
-        print(f"   🔄 自注意力: {'ON (OrbitalSelfAttention)' if use_self_attention else 'OFF (PhysicsCrossAttention)'}")
-        print(f"   📚 课程学习: Phase1(Ep1-{curriculum_phase1_epochs}) 轻核{len(phase1_isotopes)}核素 → Phase2(Ep{curriculum_phase1_epochs+1}-{num_epochs}) 全{len(all_isotopes)}核素")
-        print(f"   🎯 全轨道训练: {len(ALL_STATES)}个态 (不渐进扩展)")
-        print(f"   📊 精简损失: 6个核心损失 (PDE+Norm+Node+PhysicalState+Smoothness+Rayleigh)")
-        print(f"   🔍 RHF一致性监督: 每{rhf_checker.check_every}步检查")
+        print(f"   ⏱️  物理损失频率: 每 {phy_loss_every_n_batches} 个batch算一次")
+        print(f"   📚 课程学习: Phase1(Ep1-{curriculum_phase1_epochs}) → Phase2(Ep{curriculum_phase1_epochs+1}-{curriculum_phase2_epochs}) → Phase3(Ep{curriculum_phase2_epochs+1}-{num_epochs})")
 
     # ================================================================
-    #   课程学习：阶段1 初始化（全轨道+轻核预热）
+    #   课程学习：阶段1 初始化
     # ================================================================
     if is_main:
         print(f"\n{'='*60}")
-        print(f"  📚 课程学习阶段1: 轻核预热 (Epoch 1-{curriculum_phase1_epochs})")
-        print(f"  🎯 核素: {phase1_isotopes} | 态: 全部{len(ALL_STATES)}个")
+        print(f"  📚 课程学习阶段1: 双幻核预热 (Epoch 1-{curriculum_phase1_epochs})")
         print(f"{'='*60}")
 
     current_isotopes = phase1_isotopes
@@ -480,7 +517,7 @@ def train_model():
                                   traj_usage_ratio=traj_usage_ratio,
                                   mode='test', target_states=target_states)
 
-    # DataLoader — ★ 使用 IsotopeGroupedBatchSampler 保证同核素轨道在同一batch
+    # DataLoader
     def make_loader(dataset, batch_sz, shuffle=True):
         if dataset is None or len(dataset) == 0:
             return None
@@ -490,10 +527,9 @@ def train_model():
             return DataLoader(dataset, batch_size=actual_batch, sampler=sampler,
                               num_workers=4, pin_memory=True, persistent_workers=True,
                               drop_last=len(dataset) >= actual_batch * 2)
-        # ★ 单卡模式使用 IsotopeGroupedBatchSampler
-        batch_sampler = IsotopeGroupedBatchSampler(dataset, actual_batch, shuffle=shuffle)
-        return DataLoader(dataset, batch_sampler=batch_sampler,
-                          num_workers=4, pin_memory=True, persistent_workers=True)
+        return DataLoader(dataset, batch_size=actual_batch, shuffle=shuffle,
+                          num_workers=4, pin_memory=True, persistent_workers=True,
+                          drop_last=len(dataset) >= actual_batch * 2)
 
     train_loader = make_loader(train_dataset, batch_size, shuffle=True)
     val_loader = make_loader(val_dataset, batch_size, shuffle=False)
@@ -518,8 +554,7 @@ def train_model():
         import time; t0 = time.time()
 
     model = RHF_FNO_GRU(in_channels=12, hidden_dim=hidden_dim, npt=201,
-                        gru_hidden=gru_hidden, modes=modes,
-                        use_self_attention=use_self_attention).to(device)
+                        gru_hidden=gru_hidden, modes=modes).to(device)
 
     if is_main:
         total_p = sum(p.numel() for p in model.parameters())
@@ -537,17 +572,15 @@ def train_model():
     base_r_grid = torch.arange(0, 201, device=device, dtype=torch.float32) * dr
     base_r_grid[0] = 0.0010
 
-    # 初始化 CSV 日志（★ 精简6损失 + RHF一致性）
+    # 初始化 CSV 日志（★ 物理主导模式）
     if is_main:
         with open(log_csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['epoch', 'phase', 'total_loss', 'loss_data',
-                           'loss_pde', 'loss_norm', 'loss_node',
-                           'loss_physical', 'loss_smooth', 'loss_rayleigh',
-                           'loss_consistency',
-                           'E_rayleigh', 'E_network', 'E_kin',
-                           'vps_core', 'vms_core', 'norm_integral',
-                           'learning_rate', 'best_epoch', 'n_isotopes'])
+            writer.writerow(['epoch', 'phase', 'total_loss', 'loss_data', 'loss_pde', 'loss_norm',
+                           'loss_node', 'loss_boundary', 'loss_energy', 'loss_kinetic',
+                           'loss_energy_range', 'loss_shape', 'loss_bsmooth', 'loss_peak',
+                           'loss_energy_mse', 'energy_pred', 'vps_core',
+                           'learning_rate', 'best_epoch', 'active_isotopes'])
 
     best_data_loss = float('inf')
     patience = 9999
@@ -564,30 +597,35 @@ def train_model():
     for epoch in range(1, num_epochs + 1):
 
         # ══════════════════════════════════════
-        # ★ 课程学习：2阶段（轻核→全核素），全轨道不扩展
+        # ★ 渐进式课程学习：态数量扩展（核素固定不变）
+        #   Phase1 → Phase2 → Phase3: 仅增加态, 不增加核素
         # ══════════════════════════════════════
         new_phase = 1
-        new_isotopes = phase1_isotopes
+        new_target_states = PHASE1_STATES  # 7个核心束缚态
 
-        if epoch > curriculum_phase1_epochs:
+        if epoch > curriculum_phase1_epochs and epoch <= curriculum_phase2_epochs:
             new_phase = 2
-            new_isotopes = all_isotopes  # ★ Phase2: 全部核素
+            new_target_states = PHASE2_STATES  # 21个态(n≤2)
+        elif epoch > curriculum_phase2_epochs:
+            new_phase = 3
+            new_target_states = PHASE3_STATES  # 全部42个态
 
-        # 切换阶段时重建数据集
-        if new_phase != current_phase or set(new_isotopes) != set(current_isotopes):
+        # ★ 核素永远不变，仅切换态列表
+        if new_phase != current_phase or set(new_target_states) != set(target_states):
             current_phase = new_phase
-            current_isotopes = new_isotopes
+            target_states = new_target_states
 
             if is_main:
                 phase_info = {
-                    1: ("轻核预热", phase1_isotopes),
-                    2: ("全核素精调", all_isotopes),
+                    1: ("核心束缚态学习", PHASE1_STATES),
+                    2: ("激发壳层扩展", PHASE2_STATES),
+                    3: ("全轨道精调", PHASE3_STATES),
                 }
-                name, isos = phase_info[new_phase]
+                name, states = phase_info[new_phase]
                 print(f"\n{'='*60}")
                 print(f"  📚 Phase{new_phase}: {name} (Epoch {epoch}+)")
-                print(f"  🎯 核素: {len(isos)} 个 | 态: 全部{len(ALL_STATES)}个")
-                print(f"  📋 核素列表: {isos}")
+                print(f"  🎯 核子态: {len(states)} 个 | 核素: {current_isotopes}")
+                print(f"  📋 态列表: {states}")
                 print(f"{'='*60}")
 
             # 重建训练集
@@ -627,10 +665,14 @@ def train_model():
         total_loss_pde = 0.0
         total_loss_norm = 0.0
         total_loss_node = 0.0
-        total_loss_physical = 0.0
-        total_loss_smooth = 0.0
-        total_loss_rayleigh = 0.0
-        total_loss_consistency = 0.0
+        total_loss_boundary = 0.0
+        total_loss_energy = 0.0
+        total_loss_kinetic = 0.0
+        total_loss_shape = 0.0
+        total_loss_bsmooth = 0.0
+        total_loss_energy_range = 0.0
+        total_loss_peak = 0.0
+        total_loss_energy_mse = 0.0
         num_batches = 0
 
         optimizer.zero_grad(set_to_none=True)
@@ -671,44 +713,98 @@ def train_model():
                 loss_others = nn.functional.mse_loss(y_pred_others_norm, y_true_others_norm)
                 loss_data = loss_gf + loss_others
 
-                # ★ 精简物理损失（6个核心损失 + RHF一致性）
+                # 物理损失（频率控制加速）
                 if compute_physics:
-                    phy_components = calc_simplified_residual(
-                        pred_tensor=y_pred,
-                        kappa=kappa,
-                        dr=dr,
-                        n_principal=n_principal,
-                        y_true=y_true
-                    )
-                    loss_pde = phy_components['loss_pde']
-                    loss_norm = phy_components['loss_norm']
-                    loss_node = phy_components['loss_node']
-                    loss_physical = phy_components['loss_physical_state']
-                    loss_smooth = phy_components['loss_smoothness']
-                    loss_rayleigh = phy_components['loss_energy_rayleigh']
+                    if not hasattr(model, '_phy_ref_scale'):
+                        phy_components = calc_physics_residual(
+                            pred_tensor=y_pred,
+                            kappa=kappa,
+                            stats_mean=y_mean,
+                            stats_std=y_std,
+                            dr=dr,
+                            ref_scale=None,
+                            return_components=True,
+                            n_principal=n_principal,  # ★ 传入主量子数
+                            y_true=y_true             # ★ 传入真实标签用于loss_peak
+                        )
+                        ref_total = phy_components['loss_total'].detach().clone()
+                        if use_ddp:
+                            dist.all_reduce(ref_total, op=dist.ReduceOp.MAX)
+                        estimated_ref = max(ref_total.item(), 100.0)
+                        model._phy_ref_scale = estimated_ref
+                        if is_main:
+                            print(f"  📐 物理损失参考尺度: {estimated_ref:.2f}")
+                        # ★ PDE/Norm 已在 calc_physics_residual 内部用 sqrt(ref) 缩放
+                        # 这里不再额外除 ref，避免双重压制！
+                        loss_pde = phy_components['loss_pde']
+                        loss_norm = phy_components['loss_norm']  # 不再 / estimated_ref！
+                        loss_node = phy_components['loss_node']
+                        loss_boundary = phy_components.get('loss_boundary', torch.tensor(0.0, device=device))
+                        loss_energy = phy_components.get('loss_positive_energy', torch.tensor(0.0, device=device))
+                        loss_kinetic = phy_components.get('loss_kinetic_positive', torch.tensor(0.0, device=device))
+                        loss_shape = phy_components.get('loss_shape', torch.tensor(0.0, device=device))       # ★
+                        loss_bsmooth = phy_components.get('loss_boundary_smooth', torch.tensor(0.0, device=device))  # ★
+                        loss_energy_range = phy_components.get('loss_energy_range', torch.tensor(0.0, device=device))  # ★ 能量范围
+                        loss_peak = phy_components.get('loss_peak', torch.tensor(0.0, device=device))  # ★ 峰值位置匹配
+                        loss_energy_rayleigh = phy_components.get('loss_energy_rayleigh', torch.tensor(0.0, device=device))  # ★ Rayleigh能量
+                    else:
+                        phy_components = calc_physics_residual(
+                            pred_tensor=y_pred,
+                            kappa=kappa,
+                            stats_mean=y_mean,
+                            stats_std=y_std,
+                            dr=dr,
+                            ref_scale=model._phy_ref_scale,
+                            return_components=True,
+                            n_principal=n_principal,  # ★ 传入主量子数
+                            y_true=y_true             # ★ 传入真实标签用于loss_peak
+                        )
+                        loss_pde = phy_components['loss_pde']
+                        loss_norm = phy_components['loss_norm']
+                        loss_node = phy_components.get('loss_node', torch.tensor(0.0, device=device))
+                        loss_boundary = phy_components.get('loss_boundary', torch.tensor(0.0, device=device))
+                        loss_energy = phy_components.get('loss_positive_energy', torch.tensor(0.0, device=device))
+                        loss_kinetic = phy_components.get('loss_kinetic_positive', torch.tensor(0.0, device=device))
+                        loss_shape = phy_components.get('loss_shape', torch.tensor(0.0, device=device))       # ★
+                        loss_bsmooth = phy_components.get('loss_boundary_smooth', torch.tensor(0.0, device=device))  # ★
+                        loss_energy_range = phy_components.get('loss_energy_range', torch.tensor(0.0, device=device))  # ★ 能量范围
+                        loss_peak = phy_components.get('loss_peak', torch.tensor(0.0, device=device))  # ★ 峰值位置匹配
+                        loss_energy_rayleigh = phy_components.get('loss_energy_rayleigh', torch.tensor(0.0, device=device))  # ★ Rayleigh能量
 
-                    # ★ RHF一致性检查（每N步）
-                    consistency_residual, rhf_diag = rhf_checker.compute_consistency(
-                        pred_tensor=y_pred, kappa=kappa, dr=dr, n_principal=n_principal
-                    )
-                    loss_consistency = consistency_residual * lambda_consistency
+                    # ★ 全态能量MSE约束：E_pred vs E_true
+                    # 物理依据：网络输出通道9为能量E，y_true通道9为真实收敛能量
+                    # 直接用MSE驱动预测能量逼近真实值，适用于所有量子态
+                    # 这比硬编码阈值更通用：1s1/2的E≈-37MeV, 2s1/2的E≈-3MeV，各自收敛到真实值
+                    E_pred = y_pred[:, 9, :].mean(dim=1)   # (B,) 预测能量
+                    E_true = y_true[:, 9, :].mean(dim=1)   # (B,) 真实能量
+                    loss_energy_mse = nn.functional.mse_loss(E_pred, E_true)
 
-                    # ★ 精简损失组合
-                    loss_phy = (lambda_pde * loss_pde +
-                                lambda_norm * loss_norm +
-                                lambda_node * loss_node +
-                                lambda_physical * loss_physical +
-                                lambda_smooth * loss_smooth +
-                                lambda_rayleigh * loss_rayleigh +
-                                loss_consistency)
+                    # ★ 物理主导损失组合: PDE > Norm > Node > Energy/Kinetic > Shape/Boundary > Peak >> Data(MSE辅助)
+                    loss_phy = (lambda_pde * loss_pde +          # ★ PDE 主导！狄拉克方程残差
+                                lambda_norm * loss_norm +        # 归一化约束
+                                lambda_node * loss_node +        # 节点数精确约束
+                                lambda_energy * loss_energy +    # ★ 正能量约束（标量密度>0）
+                                lambda_kinetic * loss_kinetic +  # ★ 动能正定性（防负能量海）
+                                lambda_energy_range * loss_energy_range +  # ★ 能量范围 (-80~+50 MeV)
+                                lambda_energy_mse * loss_energy_mse +  # ★ 全态能量MSE（E_pred→E_true）
+                                lambda_energy_rayleigh * loss_energy_rayleigh +  # ★ Rayleigh商能量一致性
+                                lambda_boundary * loss_boundary + # 边界端点约束
+                                lambda_shape * loss_shape +       # ★ 波形形态惩罚（防偷懒）
+                                lambda_bsmooth * loss_bsmooth +   # ★ 边界平滑性（反震荡）
+                                lambda_peak * loss_peak)          # ★ 峰值位置匹配
                 else:
                     loss_pde = torch.tensor(0.0, device=device)
                     loss_norm = torch.tensor(0.0, device=device)
                     loss_node = torch.tensor(0.0, device=device)
-                    loss_physical = torch.tensor(0.0, device=device)
-                    loss_smooth = torch.tensor(0.0, device=device)
-                    loss_rayleigh = torch.tensor(0.0, device=device)
-                    loss_consistency = torch.tensor(0.0, device=device)
+                    loss_boundary = torch.tensor(0.0, device=device)
+                    loss_energy = torch.tensor(0.0, device=device)
+                    loss_kinetic = torch.tensor(0.0, device=device)
+                    loss_shape = torch.tensor(0.0, device=device)       # ★
+                    loss_bsmooth = torch.tensor(0.0, device=device)    # ★
+                    loss_energy_range = torch.tensor(0.0, device=device)  # ★ 能量范围
+                    loss_peak = torch.tensor(0.0, device=device)       # ★ 峰值位置匹配
+                    loss_energy_mse = torch.tensor(0.0, device=device)  # ★ 全态能量MSE
+                    loss_energy_rayleigh = torch.tensor(0.0, device=device)  # ★ Rayleigh能量
                     loss_phy = torch.tensor(0.0, device=device)
 
                 # ★ 总损失 = 弱MSE辅助 + 强物理主导
@@ -737,24 +833,29 @@ def train_model():
             total_loss_pde += (loss_pde.item() * grad_accum_steps) if isinstance(loss_pde, torch.Tensor) and loss_pde.requires_grad else 0.0
             total_loss_norm += (loss_norm.item() * grad_accum_steps) if isinstance(loss_norm, torch.Tensor) and loss_norm.requires_grad else 0.0
             total_loss_node += (loss_node.item() * grad_accum_steps) if isinstance(loss_node, torch.Tensor) and loss_node.requires_grad else 0.0
-            total_loss_physical += (loss_physical.item() * grad_accum_steps) if isinstance(loss_physical, torch.Tensor) and loss_physical.requires_grad else 0.0
-            total_loss_smooth += (loss_smooth.item() * grad_accum_steps) if isinstance(loss_smooth, torch.Tensor) and loss_smooth.requires_grad else 0.0
-            total_loss_rayleigh += (loss_rayleigh.item() * grad_accum_steps) if isinstance(loss_rayleigh, torch.Tensor) and loss_rayleigh.requires_grad else 0.0
-            total_loss_consistency += (loss_consistency.item() * grad_accum_steps) if isinstance(loss_consistency, torch.Tensor) and loss_consistency.requires_grad else 0.0
+            total_loss_boundary += (loss_boundary.item() * grad_accum_steps) if isinstance(loss_boundary, torch.Tensor) and loss_boundary.requires_grad else 0.0
+            total_loss_energy += (loss_energy.item() * grad_accum_steps) if isinstance(loss_energy, torch.Tensor) and loss_energy.requires_grad else 0.0
+            total_loss_kinetic += (loss_kinetic.item() * grad_accum_steps) if isinstance(loss_kinetic, torch.Tensor) and loss_kinetic.requires_grad else 0.0
+            total_loss_shape += (loss_shape.item() * grad_accum_steps) if isinstance(loss_shape, torch.Tensor) and loss_shape.requires_grad else 0.0
+            total_loss_bsmooth += (loss_bsmooth.item() * grad_accum_steps) if isinstance(loss_bsmooth, torch.Tensor) and loss_bsmooth.requires_grad else 0.0
+            total_loss_energy_range += (loss_energy_range.item() * grad_accum_steps) if isinstance(loss_energy_range, torch.Tensor) and loss_energy_range.requires_grad else 0.0
+            total_loss_peak += (loss_peak.item() * grad_accum_steps) if isinstance(loss_peak, torch.Tensor) and loss_peak.requires_grad else 0.0
+            total_loss_energy_mse += (loss_energy_mse.item() * grad_accum_steps) if isinstance(loss_energy_mse, torch.Tensor) and loss_energy_mse.requires_grad else 0.0
             num_batches += 1
 
-        # LR调度（2阶段）
-        if current_phase == 1:
-            # 阶段1: 预热+常数LR
+        # LR调度
+        if current_phase < 3:
+            # 阶段1-2: 使用简单的预热+常数LR
             if epoch <= 5:
                 for pg in optimizer.param_groups:
                     pg['lr'] = learning_rate * epoch / 5
+            # 阶段2后半段开始微降
+            elif current_phase == 2 and epoch > curriculum_phase1_epochs + 50:
+                decay = 1.0 - 0.5 * (epoch - curriculum_phase1_epochs - 50) / (curriculum_phase2_epochs - curriculum_phase1_epochs - 50)
+                for pg in optimizer.param_groups:
+                    pg['lr'] = learning_rate * max(decay, 0.5)
         else:
-            # 阶段2: Cosine Annealing
-            if not hasattr(model, '_cosine_scheduler_initialized'):
-                remaining_epochs = num_epochs - epoch + 1
-                _cosine_scheduler = CosineAnnealingLR(optimizer, T_max=remaining_epochs, eta_min=1e-6)
-                model._cosine_scheduler_initialized = True
+            # 阶段3: Cosine Annealing
             if hasattr(model, '_cosine_scheduler_initialized'):
                 _cosine_scheduler.step()
 
@@ -767,10 +868,14 @@ def train_model():
         loss_pde_avg = total_loss_pde / n_batches
         loss_norm_avg = total_loss_norm / n_batches
         loss_node_avg = total_loss_node / n_batches
-        loss_physical_avg = total_loss_physical / n_batches
-        loss_smooth_avg = total_loss_smooth / n_batches
-        loss_rayleigh_avg = total_loss_rayleigh / n_batches
-        loss_consistency_avg = total_loss_consistency / n_batches
+        loss_boundary_avg = total_loss_boundary / n_batches
+        loss_energy_avg = total_loss_energy / n_batches
+        loss_kinetic_avg = total_loss_kinetic / n_batches
+        loss_shape_avg = total_loss_shape / n_batches       # ★
+        loss_bsmooth_avg = total_loss_bsmooth / n_batches   # ★
+        loss_energy_range_avg = total_loss_energy_range / n_batches  # ★ 能量范围
+        loss_peak_avg = total_loss_peak / n_batches  # ★ 峰值位置匹配
+        loss_energy_mse_avg = total_loss_energy_mse / n_batches  # ★ 全态能量MSE
 
         # Early Stopping
         current_data_loss = loss_data_avg
@@ -784,22 +889,23 @@ def train_model():
         else:
             patience_counter += 1
 
-        # Epoch 日志（★ 精简6损失 + RHF一致性）
+        # Epoch 日志（★ 物理主导模式 + 能量诊断）
         if is_main:
-            # ★ 从精简损失获取诊断信息
-            with torch.no_grad():
-                sample_y_ph = model(x_seq_norm, kappa, batch_r_grid,
-                                    is_proton=is_proton, z_num=z_num, n_num=n_num,
-                                    n_principal=n_principal)
-                phy_diag = calc_simplified_residual(
-                    sample_y_ph, kappa, dr=dr, n_principal=n_principal, y_true=y_true
-                )
-                E_rayleigh_val = phy_diag.get('energy_rayleigh', torch.tensor(0.0)).item() if isinstance(phy_diag.get('energy_rayleigh'), torch.Tensor) else 0.0
-                E_network_val = phy_diag.get('energy_network', torch.tensor(0.0)).item() if isinstance(phy_diag.get('energy_network'), torch.Tensor) else 0.0
-                E_kin_val = phy_diag.get('E_kin_pure', torch.tensor(0.0)).item() if isinstance(phy_diag.get('E_kin_pure'), torch.Tensor) else 0.0
-                vps_core_val = phy_diag.get('vps_core', torch.tensor(0.0)).item() if isinstance(phy_diag.get('vps_core'), torch.Tensor) else 0.0
-                vms_core_val = phy_diag.get('vms_core', torch.tensor(0.0)).item() if isinstance(phy_diag.get('vms_core'), torch.Tensor) else 0.0
-                norm_int_val = phy_diag.get('norm_integral', torch.tensor(0.0)).item() if isinstance(phy_diag.get('norm_integral'), torch.Tensor) else 0.0
+            # ★ 从物理残差中提取能量和势场诊断值
+            if hasattr(model, '_phy_ref_scale'):
+                with torch.no_grad():
+                    sample_y_ph = model(x_seq_norm, kappa, batch_r_grid,
+                                        is_proton=is_proton, z_num=z_num, n_num=n_num,
+                                        n_principal=n_principal)
+                    phy_diag = calc_physics_residual(
+                        sample_y_ph, kappa, y_mean, y_std,
+                        dr=dr, return_components=True, n_principal=n_principal,
+                        y_true=y_true  # ★ 传入真实标签用于loss_peak
+                    )
+                    energy_pred_val = phy_diag.get('energy_E', 0.0).item() if 'energy_E' in phy_diag else 0.0
+                    vps_core_val = phy_diag.get('vps_core', 0.0).item() if 'vps_core' in phy_diag else 0.0
+            else:
+                energy_pred_val, vps_core_val = 0.0, 0.0
 
             with open(log_csv_path, 'a', newline='') as f:
                 writer = csv.writer(f)
@@ -807,42 +913,42 @@ def train_model():
                     epoch, current_phase,
                     f"{loss_total_avg:.6f}", f"{loss_data_avg:.6f}",
                     f"{loss_pde_avg:.6f}", f"{loss_norm_avg:.6f}",
-                    f"{loss_node_avg:.6f}",
-                    f"{loss_physical_avg:.6f}", f"{loss_smooth_avg:.6f}",
-                    f"{loss_rayleigh_avg:.6f}", f"{loss_consistency_avg:.6f}",
-                    f"{E_rayleigh_val:.4f}", f"{E_network_val:.4f}",
-                    f"{E_kin_val:.4f}",
-                    f"{vps_core_val:.4f}", f"{vms_core_val:.4f}",
-                    f"{norm_int_val:.6f}",
+                    f"{loss_node_avg:.6f}", f"{loss_boundary_avg:.6f}",
+                    f"{loss_energy_avg:.8f}", f"{loss_kinetic_avg:.8f}",
+                    f"{loss_energy_range_avg:.8f}",
+                    f"{loss_shape_avg:.6f}", f"{loss_bsmooth_avg:.6f}",
+                    f"{loss_peak_avg:.6f}",
+                    f"{loss_energy_mse_avg:.6f}",
+                    f"{energy_pred_val:.4f}", f"{vps_core_val:.4f}",
                     f"{current_lr:.2e}",
                     best_epoch, len(current_isotopes)
                 ])
 
             if epoch % 5 == 0 or epoch == 1:
-                phase_names = {1: "轻核预热", 2: "全核素精调"}
+                phase_names = {1: "核心束缚态", 2: "激发壳层", 3: "全轨道精调"}
                 print(f"Epoch [{epoch:3d}/{num_epochs}] | Phase{current_phase}({phase_names[current_phase]}) | LR: {current_lr:.2e}", flush=True)
-                print(f"  [精简6损失] Total: {loss_total_avg:.4f} | Data: {loss_data_avg:.4f}(×{lambda_data}) | PDE: {loss_pde_avg:.4f}(×{lambda_pde}) | Norm: {loss_norm_avg:.4f}(×{lambda_norm})", flush=True)
-                print(f"              Node: {loss_node_avg:.4f}(×{lambda_node}) | Physical: {loss_physical_avg:.6f}(×{lambda_physical}) | Smooth: {loss_smooth_avg:.4f}(×{lambda_smooth}) | Rayleigh: {loss_rayleigh_avg:.6f}(×{lambda_rayleigh})", flush=True)
-                print(f"              Consistency: {loss_consistency_avg:.6f}(×{lambda_consistency})", flush=True)
-                print(f"  [RHF监督] E_rayleigh={E_rayleigh_val:.2f} MeV | E_network={E_network_val:.2f} MeV | E_kin={E_kin_val:.2f} | norm={norm_int_val:.6f}", flush=True)
-                print(f"            vps_core={vps_core_val:.2f} | vms_core={vms_core_val:.2f}", flush=True)
+                print(f"  [物理主导] Loss: {loss_total_avg:.4f} | Data: {loss_data_avg:.4f}(×{lambda_data}) | PDE: {loss_pde_avg:.4f}(×{lambda_pde}) | Norm: {loss_norm_avg:.4f}(×{lambda_norm}) | Node: {loss_node_avg:.4f}(×{lambda_node})", flush=True)
+                print(f"             Energy: {loss_energy_avg:.6f}(×{lambda_energy}) | Kinetic: {loss_kinetic_avg:.6f}(×{lambda_kinetic}) | E_Range: {loss_energy_range_avg:.6f}(×{lambda_energy_range}) | Boundary: {loss_boundary_avg:.6f}(×{lambda_boundary})", flush=True)
+                print(f"             Shape: {loss_shape_avg:.6f}(×{lambda_shape}) | BSmooth: {loss_bsmooth_avg:.6f}(×{lambda_bsmooth}) | Peak: {loss_peak_avg:.6f}(×{lambda_peak}) | E_MSE: {loss_energy_mse_avg:.6f}(×{lambda_energy_mse})", flush=True)
+                print(f"             ★ E_pred={energy_pred_val:.2f} MeV | vps_core={vps_core_val:.2f}", flush=True)
 
             # 物理验证
             if epoch % plot_interval == 0 or epoch == 1:
                 with torch.no_grad():
                     sample_y_pred = model(x_seq_norm, kappa, batch_r_grid,
                                          is_proton=is_proton, z_num=z_num, n_num=n_num,
-                                         n_principal=n_principal)
+                                         n_principal=n_principal)  # ★ 传入主量子数
                     norm_vals, is_norm = verify_normalization(
                         sample_y_pred, batch_r_grid, kappa, dr=dr,
                         stats_mean=y_mean, stats_std=y_std
                     )
                     print(f"  [Physics] Norm integral: {norm_vals.mean().item():.6f} | Valid: {is_norm}", flush=True)
 
+                    # 绘图（传入真实物理值的Y_true和统计量以做反归一化）
                     plot_path = plot_wavefunctions(
                         sample_y_pred, y_true, batch_r_grid, kappa,
                         epoch, plot_dir, stats_mean=y_mean, stats_std=y_std,
-                        is_proton=is_proton, n_principal=n_principal
+                        is_proton=is_proton, n_principal=n_principal  # ★ 传入主量子数
                     )
                     if plot_path:
                         print(f"  [Plot] {plot_path}", flush=True)
@@ -896,7 +1002,7 @@ def train_model():
             df = pd.read_csv(log_csv_path)
 
             fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-            fig.suptitle('Training Loss V2 (All Orbits + Self-Attention + RHF Supervision)', fontsize=14, fontweight='bold')
+            fig.suptitle('Training Loss Analysis (Curriculum Learning)', fontsize=14, fontweight='bold')
 
             axes[0, 0].plot(df['epoch'], df['total_loss'], 'b-', linewidth=2)
             axes[0, 0].set_xlabel('Epoch')
@@ -904,13 +1010,12 @@ def train_model():
             axes[0, 0].set_title('Total Loss')
             axes[0, 0].grid(True, alpha=0.3)
 
-            if 'loss_pde' in df.columns:
-                axes[0, 1].plot(df['epoch'], df['loss_data'], 'g-', label='Data', linewidth=2)
-                axes[0, 1].plot(df['epoch'], df['loss_pde'], 'r-', label='PDE', linewidth=2)
-                axes[0, 1].plot(df['epoch'], df['loss_norm'], 'm-', label='Norm', linewidth=2)
+            axes[0, 1].plot(df['epoch'], df['loss_data'], 'g-', label='Data Loss', linewidth=2)
+            axes[0, 1].plot(df['epoch'], df['loss_pde'], 'r-', label='PDE Loss', linewidth=2)
+            axes[0, 1].plot(df['epoch'], df['loss_norm'], 'm-', label='Norm Loss', linewidth=2)
             axes[0, 1].set_xlabel('Epoch')
             axes[0, 1].set_ylabel('Loss')
-            axes[0, 1].set_title('6 Core Loss Components')
+            axes[0, 1].set_title('Loss Components')
             axes[0, 1].legend()
             axes[0, 1].grid(True, alpha=0.3)
 
@@ -920,17 +1025,19 @@ def train_model():
             axes[1, 0].set_title('Learning Rate Schedule')
             axes[1, 0].grid(True, alpha=0.3)
 
-            if 'E_rayleigh' in df.columns:
-                axes[1, 1].plot(df['epoch'], df['E_rayleigh'], 'purple', linewidth=2, label='E_rayleigh')
-                axes[1, 1].plot(df['epoch'], df['E_network'], 'orange', linewidth=2, label='E_network')
+            axes[1, 1].plot(df['epoch'], df['loss_pde'], 'purple', linewidth=2, label='PDE Loss')
+            axes[1, 1].plot(df['epoch'], df['loss_norm'], 'green', linewidth=2, label='Norm Loss')
+            # 标注课程学习阶段
+            axes[1, 1].axvline(x=curriculum_phase1_epochs, color='r', linestyle='--', alpha=0.5, label='Phase1→2')
+            axes[1, 1].axvline(x=curriculum_phase2_epochs, color='b', linestyle='--', alpha=0.5, label='Phase2→3')
             axes[1, 1].set_xlabel('Epoch')
-            axes[1, 1].set_ylabel('Energy (MeV)')
-            axes[1, 1].set_title('RHF Consistency: Energy')
+            axes[1, 1].set_ylabel('λ_physics')
+            axes[1, 1].set_title('Physics Loss Weight (Sigmoid Ramp)')
             axes[1, 1].legend()
             axes[1, 1].grid(True, alpha=0.3)
 
             plt.tight_layout()
-            loss_plot_path = os.path.join(log_dir, 'loss_curves_v2.png')
+            loss_plot_path = os.path.join(log_dir, 'loss_curves.png')
             plt.savefig(loss_plot_path, dpi=150, bbox_inches='tight')
             plt.close()
             print(f"📈 Loss 曲线: {loss_plot_path}")

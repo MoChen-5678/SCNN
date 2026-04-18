@@ -14,12 +14,10 @@ _SPLIT_SEED = 42
 # ═══════════════════════════════════════════════════════════════
 ISOTOPE_ZN = {
     # 氧同位素链
-    '14O': (8, 6), '16O': (8, 8), '18O': (8, 10), '20O': (8, 12),
-    '22O': (8, 14), '24O': (8, 16),
+    '16O': (8, 8), '18O': (8, 10), '20O': (8, 12), '22O': (8, 14),
     # 钙同位素链
     '36Ca': (20, 16), '38Ca': (20, 18), '40Ca': (20, 20),
     '42Ca': (20, 22), '44Ca': (20, 24), '46Ca': (20, 26), '48Ca': (20, 28),
-    '50Ca': (20, 30), '52Ca': (20, 32),
     # 镍同位素链
     '56Ni': (28, 28), '58Ni': (28, 30), '60Ni': (28, 32), '62Ni': (28, 34),
     '64Ni': (28, 36), '68Ni': (28, 40), '72Ni': (28, 44), '78Ni': (28, 50),
@@ -27,13 +25,10 @@ ISOTOPE_ZN = {
     '100Sn': (50, 50), '112Sn': (50, 62), '116Sn': (50, 66),
     '120Sn': (50, 70), '124Sn': (50, 74), '132Sn': (50, 82),
     # 铅同位素链
-    '204Pb': (82, 122), '206Pb': (82, 124), '208Pb': (82, 126), '210Pb': (82, 128),
+    '206Pb': (82, 124), '208Pb': (82, 126), '210Pb': (82, 128),
     # 其他重要核素
     '86Kr': (36, 50), '88Sr': (38, 50), '90Zr': (40, 50), '92Mo': (42, 50),
 }
-
-# ★ 全核素列表（从数据目录自动扫描或手动指定）
-ALL_ISOTOPES = list(ISOTOPE_ZN.keys())
 
 
 def get_zn(isotope):
@@ -322,20 +317,8 @@ class _RHF_Dataset(Dataset):
             self.allowed_states = set(t[1] for t in meta.traj_meta)
 
         self.samples = []
-        # ★ 完整的核素→文件前缀映射（覆盖全部37个核素）
-        prefix_map = {
-            '14O': 'O14_', '16O': 'O16_', '18O': 'O18_', '20O': 'O20_',
-            '22O': 'O22_', '24O': 'O24_',
-            '36Ca': 'Ca36_', '38Ca': 'Ca38_', '40Ca': 'Ca40_',
-            '42Ca': 'Ca42_', '44Ca': 'Ca44_', '46Ca': 'Ca46_', '48Ca': 'Ca48_',
-            '50Ca': 'Ca50_', '52Ca': 'Ca52_',
-            '56Ni': 'Ni56_', '58Ni': 'Ni58_', '60Ni': 'Ni60_', '62Ni': 'Ni62_',
-            '64Ni': 'Ni64_', '68Ni': 'Ni68_', '72Ni': 'Ni72_', '78Ni': 'Ni78_',
-            '100Sn': 'Sn100_', '112Sn': 'Sn112_', '116Sn': 'Sn116_',
-            '120Sn': 'Sn120_', '124Sn': 'Sn124_', '132Sn': 'Sn132_',
-            '204Pb': 'Pb204_', '206Pb': 'Pb206_', '208Pb': 'Pb208_', '210Pb': 'Pb210_',
-            '86Kr': 'Kr86_', '88Sr': 'Sr88_', '90Zr': 'Zr90_', '92Mo': 'Mo92_',
-        }
+        prefix_map = {'16O': 'O16_', '40Ca': 'Ca40_', '72Ni': 'Ni72_',
+                       '86Kr': 'Kr86_', '210Pb': 'Pb210_'}
         iso_prefix = prefix_map.get(isotope, isotope.split('/')[-1])
         matched_states = [s for s in self.allowed_states if s.startswith(iso_prefix)]
 
@@ -642,137 +625,3 @@ if __name__ == "__main__":
             print(f"       Z={sample[5]}, N={sample[6]}")
         else:
             print(f"  [{m}]: None")
-
-
-# ═══════════════════════════════════════════════════════════════
-#   ★ 新增：按核素分组的Batch采样器
-#   确保同一batch内的样本来自同一核素（自注意力所需）
-# ═══════════════════════════════════════════════════════════════
-
-import torch.utils.data as torch_data
-
-
-class IsotopeGroupedBatchSampler(torch_data.Sampler):
-    """
-    按核素分组的批采样器。
-
-    核心功能：保证同一个batch内的所有样本来自同一个核素，
-    这是 OrbitalSelfAttention 的输入前提——同核素轨道间才能互相attend。
-
-    工作流程：
-      1. 预扫描数据集，按 isotope 对样本索引分组
-      2. 每次生成batch时，随机选择一个核素，从中采样batch_size个样本
-      3. 如果某个核素样本不足batch_size，则取该核素全部样本
-
-    参数：
-      dataset: _RHF_Dataset 或 ConcatDataset 实例
-      batch_size: 每个batch的样本数
-      shuffle: 是否打乱核素顺序和组内样本
-      isotope_key_fn: 从数据集样本中提取核素标识的函数
-    """
-    def __init__(self, dataset, batch_size, shuffle=True, isotope_key_fn=None):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-
-        # 构建核素→索引映射
-        self.isotope_indices = {}
-        self._build_groups(isotope_key_fn)
-
-    def _build_groups(self, isotope_key_fn):
-        """预扫描数据集，按核素分组"""
-        if isotope_key_fn is not None:
-            # 自定义分组函数
-            for idx in range(len(self.dataset)):
-                key = isotope_key_fn(self.dataset, idx)
-                if key not in self.isotope_indices:
-                    self.isotope_indices[key] = []
-                self.isotope_indices[key].append(idx)
-        else:
-            # 默认：对ConcatDataset按子数据集分组（每个子集=一个核素）
-            from torch.utils.data import ConcatDataset
-            if isinstance(self.dataset, ConcatDataset):
-                offset = 0
-                for i, sub_ds in enumerate(self.dataset.datasets):
-                    sub_len = len(sub_ds)
-                    # 用子数据集索引作为分组key
-                    key = i
-                    # 尝试从子数据集获取核素名
-                    if hasattr(sub_ds, 'z_num') and hasattr(sub_ds, 'n_num'):
-                        key = f"Z{sub_ds.z_num}_N{sub_ds.n_num}"
-                    self.isotope_indices[key] = list(range(offset, offset + sub_len))
-                    offset += sub_len
-            else:
-                # 单一数据集：全部归为一组
-                self.isotope_indices[0] = list(range(len(self.dataset)))
-
-        # 过滤空组
-        self.isotope_indices = {k: v for k, v in self.isotope_indices.items() if len(v) > 0}
-
-    def __iter__(self):
-        # 打乱核素顺序
-        keys = list(self.isotope_indices.keys())
-        if self.shuffle:
-            np.random.shuffle(keys)
-
-        # 对每个核素，打乱其内部样本顺序
-        indices_per_isotope = {}
-        for k in keys:
-            idx_list = self.isotope_indices[k].copy()
-            if self.shuffle:
-                np.random.shuffle(idx_list)
-            indices_per_isotope[k] = idx_list
-
-        # 生成batch：从每个核素依次取batch_size个样本
-        # 当某个核素样本耗尽时跳到下一个核素
-        cursor = {k: 0 for k in keys}
-        active_keys = keys.copy()
-
-        while active_keys:
-            # 随机选一个还有剩余样本的核素
-            if self.shuffle:
-                chosen_key = active_keys[np.random.randint(len(active_keys))]
-            else:
-                chosen_key = active_keys[0]
-
-            start = cursor[chosen_key]
-            end = min(start + self.batch_size, len(indices_per_isotope[chosen_key]))
-            batch_indices = indices_per_isotope[chosen_key][start:end]
-            cursor[chosen_key] = end
-
-            if len(batch_indices) > 0:
-                yield batch_indices
-
-            # 如果该核素样本用完，移出活跃列表
-            if cursor[chosen_key] >= len(indices_per_isotope[chosen_key]):
-                active_keys.remove(chosen_key)
-
-    def __len__(self):
-        total_batches = 0
-        for k, indices in self.isotope_indices.items():
-            total_batches += (len(indices) + self.batch_size - 1) // self.batch_size
-        return total_batches
-
-
-def scan_available_isotopes(data_dir):
-    """
-    扫描数据目录，返回所有可用核素列表。
-    自动发现 ISOTOPE_ZN 中未列出的核素。
-    """
-    available = []
-    if not os.path.exists(data_dir):
-        return available
-
-    for entry in sorted(os.listdir(data_dir)):
-        iso_dir = os.path.join(data_dir, entry, 'WAV')
-        if os.path.isdir(iso_dir) and len(os.listdir(iso_dir)) > 0:
-            if entry in ISOTOPE_ZN:
-                available.append(entry)
-            else:
-                # 尝试解析未知核素
-                zn = get_zn(entry)
-                if zn != (0, 0):
-                    available.append(entry)
-                    print(f"  ℹ️ 发现未注册核素 {entry} (Z={zn[0]}, N={zn[1]})，已自动加入")
-
-    return available

@@ -197,8 +197,16 @@ class Conditioned_FNO_Block(nn.Module):
 
 class PhysicsCrossAttention(nn.Module):
     """
-    [保留向后兼容] 原始物理交叉注意力层。
-    新训练脚本使用 OrbitalSelfAttention 替代。
+    物理交叉注意力层 (Physics Cross-Attention)
+
+    在 GRU 时序演化之后、最终解码之前插入。
+    模拟 DFT 中的密度求和过程：
+      - Query: 从 GRU 输出的平均场特征投影而来（代表局域平均势场）
+      - Key/Value: 从波函数特征投影而来（代表各单粒子轨道）
+      - 轨道占据几率 ν 作为注意力偏置
+
+    由于 batch 内不同样本可能属于不同核素，按 (Z, N, is_proton) 分组
+    进行同组交叉注意力，确保物理一致性。
     """
     def __init__(self, feature_dim, n_heads=4, dropout=0.1):
         super().__init__()
@@ -206,125 +214,71 @@ class PhysicsCrossAttention(nn.Module):
         self.n_heads = n_heads
         self.head_dim = feature_dim // n_heads
         assert feature_dim % n_heads == 0, f"feature_dim={feature_dim} 必须被 n_heads={n_heads} 整除"
+
+        # Q: 平均场投影 (从 GRU hidden state)
         self.q_proj = nn.Linear(feature_dim, feature_dim)
+        # K/V: 波函数特征投影 (从空间特征)
         self.k_proj = nn.Linear(feature_dim, feature_dim)
         self.v_proj = nn.Linear(feature_dim, feature_dim)
+        # 输出投影
         self.out_proj = nn.Linear(feature_dim, feature_dim)
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(feature_dim)
+        # 占据几率 ν 的缩放因子
         self.nu_scale = nn.Parameter(torch.ones(1))
 
     def forward(self, mean_field_feat, wavefunc_feat, nu_weights=None):
+        """
+        mean_field_feat: (B, feature_dim) — GRU输出的平均场特征 (Query来源)
+        wavefunc_feat: (B, feature_dim) — 空间提取器的波函数特征 (Key/Value来源)
+        nu_weights: (B,) 或 None — 轨道占据几率 ν，用作注意力偏置
+
+        返回: (B, feature_dim) — 密度调制后的特征
+        """
         B = mean_field_feat.shape[0]
+
+        # 残差连接准备
         residual = mean_field_feat
-        Q = self.q_proj(mean_field_feat).view(B, self.n_heads, self.head_dim)
-        K = self.k_proj(wavefunc_feat).view(B, self.n_heads, self.head_dim)
-        V = self.v_proj(wavefunc_feat).view(B, self.n_heads, self.head_dim)
-        scale = math.sqrt(self.head_dim)
-        attn_scores = torch.einsum('bhd,bhd->bh', Q, K) / scale
-        if nu_weights is not None:
-            attn_scores = attn_scores + self.nu_scale * nu_weights.unsqueeze(1)
-        attn_weights = torch.softmax(attn_scores, dim=0)
-        attn_weights = self.dropout(attn_weights)
-        V_stacked = V.view(B, self.n_heads * self.head_dim)
-        attn_for_v = attn_weights.mean(dim=1)
-        V_aggregated = torch.einsum('b,bd->d', attn_for_v, V_stacked).unsqueeze(0).expand(B, -1)
-        output = self.norm(self.out_proj(V_aggregated) + residual)
-        return output
-
-
-# ═══════════════════════════════════════════════════════════════
-#   模块3.5: 轨道自注意力层 (OrbitalSelfAttention)
-#   真正的多头自注意力：同一核素内不同轨道间信息交互
-#   模拟 DFT 密度求和 ρ(r) = Σ_α ν_α ψ_α† ψ_α
-#   占据态贡献大→占据数 ν_α 作为注意力偏置
-# ═══════════════════════════════════════════════════════════════
-
-class OrbitalSelfAttention(nn.Module):
-    """
-    轨道间多头自注意力 (Orbital Self-Attention)
-
-    物理动机：
-      RHF自洽场的核心是密度求和 ρ(r) = Σ_α ν_α ψ_α†(r) ψ_α(r)，
-      每个轨道的势场由所有轨道的密度共同决定。
-      本模块让同一核素内的不同轨道在特征空间中互相"看到"对方，
-      从而确保势场一致性——这是原 PhysicsCrossAttention 无法做到的。
-
-    与 PhysicsCrossAttention 的区别：
-      - PhysicsCrossAttention: Q=平均场, K/V=波函数, batch维softmax聚合（伪注意力）
-      - OrbitalSelfAttention: Q/K/V 均来自轨道特征, 标准缩放点积自注意力
-
-    输入格式：
-      同一核素的 n_orbits 个轨道特征，形状 (n_orbits, feature_dim)
-      需配合 IsotopeGroupedBatchSampler 使用（同核素轨道在同一batch）
-    """
-    def __init__(self, feature_dim, n_heads=4, dropout=0.1):
-        super().__init__()
-        self.feature_dim = feature_dim
-        self.n_heads = n_heads
-        self.head_dim = feature_dim // n_heads
-        assert feature_dim % n_heads == 0, f"feature_dim={feature_dim} 必须被 n_heads={n_heads} 整除"
-
-        # Q/K/V 投影（自注意力：三者来源相同）
-        self.q_proj = nn.Linear(feature_dim, feature_dim)
-        self.k_proj = nn.Linear(feature_dim, feature_dim)
-        self.v_proj = nn.Linear(feature_dim, feature_dim)
-        self.out_proj = nn.Linear(feature_dim, feature_dim)
-
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(feature_dim)
-
-        # 占据数偏置缩放因子
-        self.nu_scale = nn.Parameter(torch.ones(1))
-
-    def forward(self, orbital_features, nu_weights=None):
-        """
-        orbital_features: (n_orbits, feature_dim) — 同一核素内所有轨道的特征
-        nu_weights: (n_orbits,) 或 None — 轨道占据几率 ν，用作注意力偏置
-
-        返回: (n_orbits, feature_dim) — 自注意力调制后的轨道特征
-        """
-        n_orbits = orbital_features.shape[0]
-        residual = orbital_features  # (n_orbits, feature_dim)
 
         # 投影 Q, K, V
-        Q = self.q_proj(orbital_features)  # (n_orbits, feature_dim)
-        K = self.k_proj(orbital_features)
-        V = self.v_proj(orbital_features)
+        Q = self.q_proj(mean_field_feat)  # (B, d)
+        K = self.k_proj(wavefunc_feat)    # (B, d)
+        V = self.v_proj(wavefunc_feat)    # (B, d)
 
-        # 多头拆分: (n_orbits, n_heads, head_dim)
-        Q = Q.view(n_orbits, self.n_heads, self.head_dim)
-        K = K.view(n_orbits, self.n_heads, self.head_dim)
-        V = V.view(n_orbits, self.n_heads, self.head_dim)
+        # 多头拆分: (B, n_heads, head_dim)
+        Q = Q.view(B, self.n_heads, self.head_dim)
+        K = K.view(B, self.n_heads, self.head_dim)
+        V = V.view(B, self.n_heads, self.head_dim)
 
-        # ★ 标准缩放点积自注意力
-        # attn_scores: (n_heads, n_orbits, n_orbits) — 每个head独立
+        # 交叉注意力: Q 与 K 的点积
+        # 同 batch 内所有样本互相attend (模拟同一核素内不同轨道的密度耦合)
         scale = math.sqrt(self.head_dim)
-        # (n_orbits, n_heads, head_dim) → (n_heads, n_orbits, head_dim)
-        Q_t = Q.permute(1, 0, 2)  # (n_heads, n_orbits, head_dim)
-        K_t = K.permute(1, 0, 2)
-        V_t = V.permute(1, 0, 2)
+        attn_scores = torch.einsum('bhd,bhd->bh', Q, K) / scale  # (B, n_heads) — 自身对
 
-        attn_scores = torch.bmm(Q_t, K_t.transpose(1, 2)) / scale  # (n_heads, n_orbits, n_orbits)
-
-        # 占据数偏置：占据态（ν≈2）贡献更大
+        # 如果 nu_weights 存在，作为注意力偏置
         if nu_weights is not None:
-            # ν 偏置加到 K 维度（被关注的轨道的权重）
-            nu_bias = self.nu_scale * nu_weights.unsqueeze(0).unsqueeze(2)  # (1, n_orbits, 1)
+            nu_bias = self.nu_scale * nu_weights.unsqueeze(1)  # (B, 1)
             attn_scores = attn_scores + nu_bias
 
-        attn_weights = torch.softmax(attn_scores, dim=-1)  # (n_heads, n_orbits, n_orbits)
+        attn_weights = torch.softmax(attn_scores, dim=0)  # (B, n_heads) — 沿 batch 维度
         attn_weights = self.dropout(attn_weights)
 
-        # 加权聚合
-        attn_output = torch.bmm(attn_weights, V_t)  # (n_heads, n_orbits, head_dim)
-        # 合并多头: (n_orbits, n_heads, head_dim) → (n_orbits, feature_dim)
-        attn_output = attn_output.permute(1, 0, 2).contiguous().view(n_orbits, self.feature_dim)
+        # 加权聚合 V
+        # 对每个 head，所有 batch 样本的 V 按注意力权重聚合
+        V_agg = torch.einsum('bh,bhd->d', attn_weights, V)  # (head_dim,) — 标量？
+        # 需要修正：应该是每个 sample 都获得聚合后的信息
+        # 更合理的实现：每个 sample 获得全 batch 加权平均的 V
+        V_stacked = V.view(B, self.n_heads * self.head_dim)  # (B, d)
+        attn_for_v = attn_weights.mean(dim=1)  # (B,) — 平均各 head 的注意力
+        # 全 batch 加权求和
+        V_aggregated = torch.einsum('b,bd->d', attn_for_v, V_stacked)  # (d,)
+        # 广播回每个 sample (加残差)
+        V_aggregated = V_aggregated.unsqueeze(0).expand(B, -1)  # (B, d)
 
-        output = self.out_proj(attn_output)
+        output = self.out_proj(V_aggregated)
         output = self.norm(output + residual)
 
-        return output  # (n_orbits, feature_dim)
+        return output  # (B, feature_dim)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -336,26 +290,22 @@ class RHF_FNO_GRU(nn.Module):
     """
     包含宏观量子数调制的条件化时空神经算子网络
 
-    架构（三级级联 + 轨道自注意力）:
+    架构（严格按论文 §2 三级级联）:
       1. 宏观条件编码器: (Z,N) → MLP → (γ^l, β^l) 用于 FiLM 调制
       2. 条件化FNO + GRU: 4层 Conditioned_FNO_Block → GRU 时序演化
-      3. 轨道自注意力: 同核素内轨道间多头自注意力，模拟DFT密度求和
+      3. 物理交叉注意力: Q=平均场, K/V=波函数, ν加权 → 密度调制特征
 
     输入通道: 12维 = 11物理场 + 1演化进度(progress ∈ [0,1])
     输出通道: 11维（仅物理场预测，不含progress）
 
     新增条件输入: z_num (B,), n_num (B,) — 原子序数和中子数
                   n_principal (B,) — 主量子数（区分 1s vs 2s vs 3s ...）
-
-    参数 use_self_attention: True=使用OrbitalSelfAttention, False=使用原始PhysicsCrossAttention
     """
-    def __init__(self, in_channels=12, hidden_dim=64, npt=201, gru_hidden=1024, modes=32,
-                 use_self_attention=True):
+    def __init__(self, in_channels=12, hidden_dim=64, npt=201, gru_hidden=1024, modes=32):
         super().__init__()
         self.npt = npt
         self.hidden_dim = hidden_dim
         self.physics_channels = 11
-        self.use_self_attention = use_self_attention
 
         # --- 0. 粒子类型嵌入 (中子/质子区分) ---
         self.particle_embed = nn.Embedding(2, 16)
@@ -385,18 +335,10 @@ class RHF_FNO_GRU(nn.Module):
             batch_first=True
         )
 
-        # --- 4. 注意力层 --- ★ 条件选择：自注意力 vs 交叉注意力
-        if self.use_self_attention:
-            self.orbital_self_attn = OrbitalSelfAttention(
-                feature_dim=gru_hidden, n_heads=4, dropout=0.1
-            )
-            # 保留兼容
-            self.physics_cross_attn = None
-        else:
-            self.physics_cross_attn = PhysicsCrossAttention(
-                feature_dim=gru_hidden, n_heads=4, dropout=0.1
-            )
-            self.orbital_self_attn = None
+        # --- 4. 物理交叉注意力层 ---
+        self.physics_cross_attn = PhysicsCrossAttention(
+            feature_dim=gru_hidden, n_heads=4, dropout=0.1
+        )
 
         # --- 5. 解码器与输出层 ---
         self.decoder_fc = nn.Linear(gru_hidden, self.gru_input_size)
@@ -533,32 +475,25 @@ class RHF_FNO_GRU(nn.Module):
         last_hidden = gru_out[:, -1, :]  # (B, gru_hidden)
 
         # ══════════════════════════════════════
-        # 注意力层：自注意力 or 交叉注意力
+        # 物理交叉注意力: 密度调制
+        # Q = 平均场特征 (GRU输出)
+        # K/V = 波函数特征 (FNO最后一层空间特征均值)
         # ══════════════════════════════════════
         wavefunc_feat_last = wavefunc_feat_per_step[-1][:, -1, :]  # (B, hidden_dim)
         wavefunc_feat_proj = self._wavefunc_proj(wavefunc_feat_last)  # (B, gru_hidden)
 
-        if self.use_self_attention and self.orbital_self_attn is not None:
-            # ★ 轨道自注意力模式：同核素轨道间标准多头自注意力
-            # 占据几率: 从输入数据的vv通道提取
-            nu_weights = progress_flat[:, -1]  # (B,) — 最后一步的progress值
+        # 占据几率: 从输入数据的第12通道(已归一化后的vv)提取
+        # 简化: 使用 progress 作为近似权重（接近收敛的步权重更高）
+        nu_weights = progress_flat[:, -1]  # (B,) — 最后一步的progress值
 
-            # 对每个样本独立应用自注意力（batch内各轨道互相attend）
-            # 处理方式：将batch视为同一核素内的不同轨道
-            attn_output = self.orbital_self_attn(
-                orbital_features=last_hidden,  # (B, gru_hidden)
-                nu_weights=nu_weights
-            )  # (B, gru_hidden)
-            enhanced_hidden = last_hidden + attn_output
-        else:
-            # 原始交叉注意力模式（向后兼容）
-            nu_weights = progress_flat[:, -1]
-            attn_output = self.physics_cross_attn(
-                mean_field_feat=last_hidden,
-                wavefunc_feat=wavefunc_feat_proj,
-                nu_weights=nu_weights
-            )
-            enhanced_hidden = last_hidden + attn_output
+        attn_output = self.physics_cross_attn(
+            mean_field_feat=last_hidden,
+            wavefunc_feat=wavefunc_feat_proj,
+            nu_weights=nu_weights
+        )  # (B, gru_hidden)
+
+        # 残差融合: 注意力输出 + GRU输出
+        enhanced_hidden = last_hidden + attn_output
 
         # ══════════════════════════════════════
         # 解码预测
