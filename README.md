@@ -1,10 +1,17 @@
 # SCNN - 核物理波函数神经网络求解器
 
-基于深度学习的相对论平均场理论（RMF）核子波函数求解器，使用谱卷积神经网络（Spectral CNN）学习满足狄拉克方程的束缚态波函数。
+基于深度学习的相对论平均场理论（RMF）核子波函数求解器，使用谱卷积神经网络（Spectral CNN）结合**轨道自注意力机制**学习满足狄拉克方程的束缚态波函数。
 
 ## 项目概述
 
-本项目实现了一个物理信息神经网络（Physics-Informed Neural Network），用于求解原子核中核子的径向狄拉克方程。核心创新是将核物理的物理约束（狄拉克方程残差、归一化条件、节点数约束等）融入神经网络训练过程，使网络学习到物理上正确的波函数解。
+本项目实现了一个物理信息神经网络（Physics-Informed Neural Network），用于求解原子核中核子的径向狄拉克方程。核心创新：
+
+1. **轨道自注意力机制**：模拟DFT密度求和 ρ(r) = Σ_α ν_α ψ_α†ψ_α，让轨道间相互感知
+2. **精简物理损失函数**：基于物理约束将12项损失精简为6项核心损失
+3. **RHF实时监督**：训练中监控势能-动能-能量一致性，异常自动警告
+4. **全核素训练**：支持37个核素（从O到Pb）的联合训练
+
+使网络学习到物理上正确的波函数解。
 
 ### 物理背景
 
@@ -26,12 +33,14 @@ dF/dr - (κ/r)F + [Σ_-(r) - M]G = εF
 
 ```
 SCNN/
-├── Data_Loader.py          # 数据加载与预处理
-├── Model_Architecture.py   # 神经网络模型定义
-├── Physics_Informed_Loss.py # 物理约束损失函数
-├── Train.py                # 训练主程序
-├── evaluate_final.py       # 模型评估脚本
-└── requirements.txt        # 依赖包列表
+├── Data_Loader.py           # 数据加载与预处理（37核素，分组采样）
+├── Model_Architecture.py    # 神经网络模型（含轨道自注意力）
+├── Physics_Informed_Loss.py # 物理约束损失函数（精简6项+RHF监督）
+├── Train.py                 # 训练主程序（全核素课程学习）
+├── evaluate_final.py        # 模型评估脚本
+├── backup/                  # 原代码备份
+├── plots/                   # 训练可视化输出
+└── requirements.txt         # 依赖包列表
 ```
 
 ## 安装依赖
@@ -46,17 +55,25 @@ pip install torch numpy matplotlib pandas
 
 ```
 results/
-├── 16O/
-│   ├── it001/           # 中子数据
-│   │   ├── 1s1-2.dat    # 1s1/2 轨道数据
-│   │   ├── 1p3-2.dat    # 1p3/2 轨道数据
+├── 16O/                    # 氧16
+│   ├── WAV/               # 波函数数据
+│   │   ├── 1s1-2.dat      # 1s1/2 轨道数据
+│   │   ├── 1p3-2.dat      # 1p3/2 轨道数据
 │   │   └── ...
-│   └── it002/           # 质子数据
-│       └── ...
-├── 40Ca/
+│   └── POT/               # 势场数据
+├── 40Ca/                   # 钙40
 │   └── ...
-└── ...
+├── 56Ni/                   # 镍56
+├── 208Pb/                  # 铅208
+└── ...                     # 共37个核素
 ```
+
+**支持的核素**（37个）：
+- 氧同位素：14O, 16O, 18O, 20O, 22O, 24O
+- 钙同位素：40Ca, 42Ca, 44Ca, 46Ca, 48Ca, 50Ca, 52Ca
+- 镍同位素：56Ni, 58Ni, 60Ni, 62Ni, 64Ni
+- 锡同位素：100Sn, 112Sn, 114Sn, 116Sn, 118Sn, 120Sn, 122Sn, 124Sn, 132Sn
+- 铅同位素：180Pb, 182Pb, 184Pb, 186Pb, 188Pb, 190Pb, 192Pb, 194Pb, 196Pb, 204Pb, 208Pb
 
 每个 `.dat` 文件包含以下列：
 - r: 径向坐标 (fm)
@@ -74,10 +91,11 @@ cd SCNN
 python Train.py
 ```
 
-训练过程采用三阶段课程学习策略：
-- **Phase 1** (Epoch 1-500): 仅学习核心束缚态（7个态）
-- **Phase 2** (Epoch 501-1200): 扩展到中等激发态（21个态）
-- **Phase 3** (Epoch 1201-3700): 全轨道精调（42个态）
+训练过程采用**两阶段课程学习策略**：
+- **Phase 1** (Epoch 1-300): 轻核课程学习（7个核素：16O, 18O, 20O, 40Ca, 42Ca, 44Ca, 56Ni）
+- **Phase 2** (Epoch 301-3000): 全核素训练（37个核素）
+
+所有阶段使用**全部42个轨道态**，通过核素难度递增实现课程学习。
 
 ### 2. 评估模型
 
@@ -92,7 +110,18 @@ python evaluate_final.py
 定义了 `RHF_FNO_GRU` 模型，结合：
 - **FNO (Fourier Neural Operator)**: 处理径向网格上的场量
 - **GRU (Gated Recurrent Unit)**: 处理序列收敛历史
+- **轨道自注意力 (OrbitalSelfAttention)**: 模拟DFT密度求和，让轨道间相互感知
 - **条件编码**: 嵌入量子数 κ、主量子数 n、质子/中子标识
+
+**OrbitalSelfAttention** 核心设计：
+```python
+# Q/K/V 均来自轨道特征，实现真正的自注意力
+Q = q_proj(orbital_features)  # (n_orbits, feature_dim)
+K = k_proj(orbital_features)
+V = v_proj(orbital_features)
+# 注意力权重结合占据数 ν_α 作为偏置
+attn_scores = Q @ K.T / sqrt(dim) + nu_scale * nu_weights
+```
 
 输入：
 - X: 初始猜测波函数序列 (B, L, 12, N)
@@ -105,38 +134,57 @@ python evaluate_final.py
 
 ### Physics_Informed_Loss.py
 
-实现了基于物理约束的损失函数，包括：
+实现了基于物理约束的**精简损失函数**（12项 → 6项核心损失）：
 
-1. **PDE 残差** (`loss_pde`): 狄拉克方程残差，使用4阶中心差分
-2. **归一化约束** (`loss_norm`): ∫(G²+F²)dr = 1
-3. **节点数约束** (`loss_node`): 根据量子数精确约束径向节点数
-4. **能量Rayleigh商** (`loss_energy_rayleigh`): 能量从波函数自然涌现
-5. **正能量约束** (`loss_positive_energy`): 标量密度 ρ_s = ∫(G²-F²)dr > 0
-6. **动能正定性** (`loss_kinetic_positive`): 纯动能期望值 > 0
-7. **能量范围** (`loss_energy_range`): 束缚态能量在 [-80, +50] MeV
-8. **波形形态** (`loss_shape`): 类高斯波包结构
-9. **峰值位置** (`loss_peak`): 波函数峰值位置匹配
-10. **边界平滑性** (`loss_boundary_smooth`): 远场无震荡
+| 损失项 | 说明 | 来源 |
+|--------|------|------|
+| `loss_pde` | 狄拉克方程残差，4阶中心差分 | 原 loss_pde |
+| `loss_norm` | 归一化约束 ∫(G²+F²)dr = 1 | 原 loss_norm |
+| `loss_node` | 径向节点数约束 | 原 loss_node |
+| `loss_physical_state` | 正能量 + 动能正定性 | 合并 loss_positive_energy + loss_kinetic_positive |
+| `loss_smoothness` | 波形平滑性（形态+边界+尾部） | 合并 loss_shape + loss_boundary_smooth + loss_boundary + loss_tv_far + loss_tail + loss_mono |
+| `loss_energy_rayleigh` | Rayleigh商能量一致性 | 原 loss_energy_rayleigh |
+
+**删除冗余项**：loss_amplitude, loss_energy_mse, loss_energy_range, loss_peak
+
+### RHFConsistencyChecker（实时监督）
+
+每N步验证势能-波函数-能量一致性：
+```python
+checker = RHFConsistencyChecker(check_every=100, lambda_consistency=2.0)
+consistency_loss, diagnostics = checker.compute_consistency(pred, kappa, dr)
+# 自动检测：E_kin < 0 或 |E_rayleigh - E_network| > 100 MeV 时警告
+```
 
 ### Train.py
 
 训练主程序，关键超参数：
 
 ```python
-# 物理损失权重
-lambda_pde = 5.0           # PDE残差（主导）
-lambda_norm = 5.0          # 归一化
-lambda_node = 8.0          # 节点数
-lambda_energy_rayleigh = 8.0  # Rayleigh商能量一致性
-lambda_energy_mse = 0.5    # 能量MSE（大幅降低）
-lambda_peak = 10.0         # 峰值位置
-lambda_shape = 8.0         # 波形形态
+# 模型配置
+use_self_attention = True   # 启用轨道自注意力
+
+# 精简物理损失权重（6项核心损失）
+lambda_data = 0.5           # 数据MSE
+lambda_pde = 5.0            # PDE残差（主导）
+lambda_norm = 5.0           # 归一化
+lambda_node = 8.0           # 节点数
+lambda_physical = 10.0      # 物理状态（正能量+动能）
+lambda_smooth = 5.0         # 平滑性
+lambda_rayleigh = 8.0       # Rayleigh商能量一致性
+lambda_consistency = 2.0    # RHF一致性监督
 
 # 训练参数
-num_epochs = 3700
+num_epochs = 3000
 learning_rate = 1e-4
 batch_size = 32
+
+# 课程学习
+phase1_isotopes = ['16O', '18O', '20O', '40Ca', '42Ca', '44Ca', '56Ni']  # 7个轻核
+phase1_epochs = 300
 ```
+
+**IsotopeGroupedBatchSampler**: 按核素分组的批采样器，保证同batch内样本来自同一核素（自注意力所需）
 
 ## 物理约束详解
 
@@ -160,11 +208,15 @@ batch_size = 32
 
 渐进式增加学习难度，防止Loss爆炸：
 
-| 阶段 | Epoch | 态数量 | 说明 |
-|------|-------|--------|------|
-| Phase 1 | 1-500 | 7 | 仅核心束缚态（1s1/2, 1p3/2等）|
-| Phase 2 | 501-1200 | 21 | 加入第一激发壳层（n=2）|
-| Phase 3 | 1201-3700 | 42 | 全部轨道（含高激发态）|
+| 阶段 | Epoch | 核素数量 | 核素列表 | 说明 |
+|------|-------|----------|----------|------|
+| Phase 1 | 1-300 | 7 | 16O, 18O, 20O, 40Ca, 42Ca, 44Ca, 56Ni | 轻核课程学习 |
+| Phase 2 | 301-3000 | 37 | 全部核素（O, Ca, Ni, Sn, Pb） | 全核素联合训练 |
+
+**特点**：
+- 所有阶段使用**全部42个轨道态**
+- 通过核素难度递增（轻核→重核）实现课程学习
+- 自注意力机制让模型学习跨核素的普适物理规律
 
 ### 数据归一化
 
@@ -203,22 +255,44 @@ batch_size = 32
 - 增加 `lambda_pde` 权重
 - 确保数据归一化正确
 
-### 2. 能量MSE收敛但物理不正确
+### 2. RHF一致性警告
 
-- 这是设计问题，已修复：能量现在通过Rayleigh商从波函数计算
-- `lambda_energy_mse` 已降至0.5，主要依靠 `lambda_energy_rayleigh`
+- 训练初期正常现象，随着训练进行会改善
+- 若持续警告，检查 `lambda_consistency` 权重
+- 查看 `rhf_consistency_log.csv` 分析异常模式
 
-### 3. 波函数形状异常
+### 3. 自注意力效果不明显
 
-- 检查 `lambda_shape` 和 `lambda_peak` 权重
-- 确保节点数约束 `lambda_node` 生效
-- 验证边界条件 `lambda_boundary`
+- 确保使用 `IsotopeGroupedBatchSampler` 分组采样
+- 检查同batch内是否来自同一核素
+- 验证 `use_self_attention=True` 已启用
 
 ### 4. 训练不稳定
 
-- 使用课程学习，从简单态开始
+- 使用课程学习，从轻核开始
 - 调整 `clip_grad_norm`（默认1.5）
 - 检查数据质量，排除异常样本
+- 观察 `loss_smoothness` 是否收敛
+
+### 5. 多核素训练内存不足
+
+- 减小 `batch_size`
+- 使用 `IsotopeGroupedBatchSampler` 减少同时加载的核素
+- 考虑使用梯度累积
+
+## 更新日志
+
+### v2.0 (2025-04-18)
+- **新增**: 轨道自注意力机制 (`OrbitalSelfAttention`)
+- **新增**: 全核素训练支持（37个核素）
+- **优化**: 损失函数精简（12项 → 6项核心损失）
+- **新增**: RHF一致性实时监督 (`RHFConsistencyChecker`)
+- **优化**: 课程学习策略（2阶段，按核素难度递增）
+
+### v1.0
+- 初始版本：物理信息神经网络求解RMF方程
+- 三阶段课程学习（按轨道态难度）
+- 12项物理约束损失函数
 
 ## 参考文献
 
