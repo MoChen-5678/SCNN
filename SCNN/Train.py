@@ -382,10 +382,17 @@ def train_model():
     lambda_shape = 8.0       # ★ 波形形态惩罚（高斯波包相似度，防偷懒）
     lambda_bsmooth = 0    # ★ 边界平滑性保护（反震荡，从5→20大幅增强）
     lambda_peak = 10.0       # ★ 峰值位置匹配损失（新增，直接约束峰位置）
-    lambda_energy_mse = 15.0   # ★ 全态能量MSE约束（E_pred vs E_true，驱动能量收敛到真实值）
+    lambda_energy_mse = 0.5    # ★ 大幅降低：能量应从波函数自然涌现，而非直接回归
+    lambda_energy_rayleigh = 8.0  # ★ 新增：Rayleigh商能量一致性权重（根据教材第3章）
 
     # ★ f分量MSE加权系数（f比g小1-2个量级，需要加权补偿）
     f_mse_weight = 5.0       # f通道MSE权重（g=1.0, f=5.0）
+
+    # ★ 新增：能量本征值迭代求解参数
+    # 策略：能量不是网络输出，而是通过Rayleigh商从波函数计算
+    # E = <ψ|H|ψ> / <ψ|ψ>，通过迭代修正使PDE残差最小化
+    energy_iteration_steps = 3      # 每batch迭代优化能量次数
+    energy_learning_rate = 0.1      # 能量修正步长
 
     # --- 课程学习超参数（速度优化版）---
     # 阶段1 (Epoch 1-500):   仅双幻核(16O+40Ca), 核心态学习 (7态)
@@ -739,6 +746,7 @@ def train_model():
                         loss_bsmooth = phy_components.get('loss_boundary_smooth', torch.tensor(0.0, device=device))  # ★
                         loss_energy_range = phy_components.get('loss_energy_range', torch.tensor(0.0, device=device))  # ★ 能量范围
                         loss_peak = phy_components.get('loss_peak', torch.tensor(0.0, device=device))  # ★ 峰值位置匹配
+                        loss_energy_rayleigh = phy_components.get('loss_energy_rayleigh', torch.tensor(0.0, device=device))  # ★ Rayleigh能量
                     else:
                         phy_components = calc_physics_residual(
                             pred_tensor=y_pred,
@@ -761,6 +769,7 @@ def train_model():
                         loss_bsmooth = phy_components.get('loss_boundary_smooth', torch.tensor(0.0, device=device))  # ★
                         loss_energy_range = phy_components.get('loss_energy_range', torch.tensor(0.0, device=device))  # ★ 能量范围
                         loss_peak = phy_components.get('loss_peak', torch.tensor(0.0, device=device))  # ★ 峰值位置匹配
+                        loss_energy_rayleigh = phy_components.get('loss_energy_rayleigh', torch.tensor(0.0, device=device))  # ★ Rayleigh能量
 
                     # ★ 全态能量MSE约束：E_pred vs E_true
                     # 物理依据：网络输出通道9为能量E，y_true通道9为真实收敛能量
@@ -778,6 +787,7 @@ def train_model():
                                 lambda_kinetic * loss_kinetic +  # ★ 动能正定性（防负能量海）
                                 lambda_energy_range * loss_energy_range +  # ★ 能量范围 (-80~+50 MeV)
                                 lambda_energy_mse * loss_energy_mse +  # ★ 全态能量MSE（E_pred→E_true）
+                                lambda_energy_rayleigh * loss_energy_rayleigh +  # ★ Rayleigh商能量一致性
                                 lambda_boundary * loss_boundary + # 边界端点约束
                                 lambda_shape * loss_shape +       # ★ 波形形态惩罚（防偷懒）
                                 lambda_bsmooth * loss_bsmooth +   # ★ 边界平滑性（反震荡）
@@ -794,6 +804,7 @@ def train_model():
                     loss_energy_range = torch.tensor(0.0, device=device)  # ★ 能量范围
                     loss_peak = torch.tensor(0.0, device=device)       # ★ 峰值位置匹配
                     loss_energy_mse = torch.tensor(0.0, device=device)  # ★ 全态能量MSE
+                    loss_energy_rayleigh = torch.tensor(0.0, device=device)  # ★ Rayleigh能量
                     loss_phy = torch.tensor(0.0, device=device)
 
                 # ★ 总损失 = 弱MSE辅助 + 强物理主导

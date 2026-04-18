@@ -46,9 +46,31 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     XF = pred_tensor[:, 6, :]
     YG = pred_tensor[:, 7, :]
     YF = pred_tensor[:, 8, :]
-    E = pred_tensor[:, 9, :].mean(dim=1, keepdim=True)
-
+    
+    # ★ 关键修改：能量通过Dirac方程本征值公式从波函数计算
+    # 根据核物理教材第3章，单粒子能量ε是Dirac方程的本征值
+    # 不是网络直接回归的目标，而是从波函数和势场自然涌现
     hbc = 197.328284
+    M_nucleon = 939.0  # 核子质量 MeV
+    
+    # 从网络输出获取初始能量猜测（仅用于PDE计算）
+    E_network = pred_tensor[:, 9, :].mean(dim=1, keepdim=True)
+    
+    # ★ 从Dirac方程计算能量期望值
+    # 根据教材公式(3.57)，能量本征值满足：
+    # ε*G = -dF/dr - (κ/r)F + [Σ_+(r) + M]G
+    # ε*F = +dG/dr + (κ/r)G + [Σ_-(r) - M]F
+    # 
+    # 其中 Σ_± = ±g_σσ + g_ωω + g_ρρτ_3 + eAτ_3 + Σ_R (重排项)
+    # 在我们的表示中：vps ≈ Σ_+, vms ≈ Σ_-
+    
+    # 计算动能项（来自波函数导数）
+    # dg_dr 和 df_dr 在下方计算，这里先预留
+    # 实际能量期望值将通过Rayleigh商计算
+    
+    # 使用网络输出的能量作为PDE计算的输入
+    # 但能量本身应该通过求解本征值问题确定
+    E = E_network  # 后续通过PDE残差驱动能量收敛到正确值
 
     # 3. 准备网格坐标 r
     r = torch.arange(0, npt, device=device, dtype=torch.float32) * dr
@@ -101,6 +123,65 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     prob_density = (g ** 2 + f ** 2) * dr
     norm_integral = torch.sum(prob_density, dim=1)
     loss_norm = torch.mean((norm_integral - 1.0) ** 2)
+    
+    # ================================================================
+    #   ★ 新增：从波函数计算能量期望值（根据教材第3章）
+    #   
+    #   根据核物理教材，单粒子能量是Dirac方程的本征值，应通过
+    #   Rayleigh商计算：ε = <ψ|h|ψ> / <ψ|ψ>
+    #   
+    #   对于径向Dirac方程，哈密顿量期望值为：
+    #   ε = ∫[ G*(-dF/dr - (κ/r)F + [Σ_+ + M]G) + F*(dG/dr + (κ/r)G + [Σ_- - M]F) ]dr
+    #     / ∫(G² + F²)dr
+    #   
+    #   当波函数满足Dirac方程时，分子 = ε * 分母，即Rayleigh商 = ε
+    # ================================================================
+    # 使用已计算的导数 dg_dr, df_dr（注意长度是npt-4，对应内部点[2:-2]）
+    # 需要填充回完整长度
+    dg_full = torch.zeros_like(g)
+    df_full = torch.zeros_like(f)
+    dg_full[:, 2:-2] = dg_dr
+    df_full[:, 2:-2] = df_dr
+    
+    # 计算哈密顿量作用在波函数上的结果（Dirac方程左侧）
+    # hψ 的第一个分量: -df/dr - (κ/r)f + [Σ_+ + M]g
+    # hψ 的第二个分量: +dg/dr + (κ/r)g + [Σ_- - M]f
+    kappa_exp_full = kappa.unsqueeze(1)
+    r_safe = r.clone()
+    r_safe[r_safe < 1e-10] = 1e-10  # 防止除零
+    
+    # Σ_+ ≈ vps (标量势+矢量势组合), Σ_- ≈ vms
+    # 这里简化处理，使用vps和vms作为有效势
+    Sigma_plus = vps  # 上分量有效势
+    Sigma_minus = vms  # 下分量有效势
+    
+    # hψ 的两个分量
+    h_psi_g = -df_full - (kappa_exp_full / r_safe) * f + (Sigma_plus + M_nucleon) * g
+    h_psi_f = dg_full + (kappa_exp_full / r_safe) * g + (Sigma_minus - M_nucleon) * f
+    
+    # Rayleigh商分子: <ψ|h|ψ> = ∫(g * h_psi_g + f * h_psi_f)dr
+    # 注意：这里使用实数波函数，内积为∫(G*h_G + F*h_F)dr
+    rayleigh_numerator = torch.sum((g * h_psi_g + f * h_psi_f) * dr, dim=1)
+    rayleigh_denominator = torch.sum((g**2 + f**2) * dr, dim=1)
+    
+    # 能量期望值（Rayleigh商）- 这是包含核子质量的总能量
+    energy_rayleigh_total = rayleigh_numerator / (rayleigh_denominator.clamp(min=1e-10))
+    
+    # ★ 关键修正：单粒子能量 ε 应该是单核子结合能（扣除静止质量）
+    # 根据教材第3章，能量泛函中的动能项和势能项都不包含静止质量
+    # ε = E_total - M_nucleon （单位：MeV）
+    energy_rayleigh = energy_rayleigh_total - M_nucleon
+    
+    # 网络输出的能量（用于比较）- 网络输出也应该是结合能
+    energy_network = E.squeeze(-1)  # (B,)
+    
+    # ★ 关键：能量一致性损失
+    # 如果波函数是正确的Dirac本征态，Rayleigh商应该等于网络输出的能量
+    # 这个损失驱动网络学习正确的波函数形状，使能量自然涌现
+    loss_energy_rayleigh = torch.mean((energy_rayleigh - energy_network) ** 2)
+    
+    # 同时保存Rayleigh能量供后续使用
+    energy_E = energy_rayleigh.detach()  # (B,)
 
     # ================================================================
     #   ★ 辅助：振幅保持（防止平凡零解）+ 反平坦偷懒
@@ -636,14 +717,16 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
             'loss_shape': loss_shape,                    # ★ 新增：波形形态惩罚
             'loss_peak': loss_peak,                      # ★ 新增：峰值位置匹配损失
             'loss_boundary_smooth': loss_boundary_smooth,# ★ 新增：边界平滑性（可单独监控）
+            'loss_energy_rayleigh': loss_energy_rayleigh, # ★ 新增：Rayleigh商能量一致性
             'norm_integral': norm_integral.detach().mean(),
-            'energy_E': E_mean,                           # ★ 新增：能量值
+            'energy_E': energy_E.mean() if 'energy_E' in locals() else E_mean,  # ★ 使用Rayleigh能量
+            'energy_rayleigh': energy_rayleigh.detach().mean(),  # ★ 新增：Rayleigh商计算的能量
             'vps_core': vps_core,                         # ★ 新增：标量势场核内均值
             'vms_core': vms_core,                         # ★ 新增：矢量势场核内均值
             'loss_total': (loss_pde + loss_norm + loss_amplitude + loss_node_anomaly
                            + loss_boundary_total + loss_positive_energy
                            + loss_kinetic_positive + loss_energy_range
-                           + loss_shape + loss_peak),
+                           + loss_shape + loss_peak + loss_energy_rayleigh),
         }
         if ref_scale is not None and ref_scale > 0:
             # ★ PDE/Norm 不做任何缩放！原始值直接输出
