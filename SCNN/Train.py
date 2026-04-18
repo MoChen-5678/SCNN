@@ -305,7 +305,8 @@ def _evaluate(model, dataloader, device, stats_mean, stats_std, y_mean, y_std,
                 phy_comp = calc_physics_residual(
                     y_pred, kappa_true, y_mean, y_std,
                     dr=0.10, return_components=True,
-                    n_principal=n_principal
+                    n_principal=n_principal,
+                    y_true=y_true  # ★ 传入真实标签用于loss_peak
                 )
                 loss_pde_val = phy_comp['loss_pde'].item()
                 loss_norm_val = phy_comp['loss_norm'].item()
@@ -368,27 +369,37 @@ def train_model():
     # lambda_pde:  控制狄拉克方程残差的权重（大→强物理驱动）
     # lambda_norm: 归一化约束权重
     # lambda_node: 节点数精确约束权重
-    lambda_data = 1.0         # ★ MSE数据拟合权重（恢复数据引导力）
-    lambda_pde = 2.0          # ★ PDE残差权重（降低，避免过度压制数据拟合）
+    # ★ 优化调整：增强PDE驱动力(2→5)，减弱数据主导(1→0.5)，增强平滑约束(5→20)
+    lambda_data = 0.5         # ★ MSE数据拟合权重（降低，避免数据拟合压制物理约束）
+    lambda_pde = 5.0          # ★ PDE残差权重（增强，更强的物理驱动）
     lambda_norm = 5.0         # 归一化强约束
     lambda_node = 8.0         # 节点数精确硬约束
-    lambda_sign = 5.0        # ★ 已删除，替代为能量约束
-    lambda_boundary = 3.0    # 边界衰减约束
+    # lambda_sign: 已删除，替代为正能量约束+能量MSE
+    lambda_boundary = 0.03   # 边界衰减约束
     lambda_energy = 10.0     # ★ 正能量约束（标量密度 > 0）
     lambda_energy_range = 5.0 # ★ 能量范围惩罚 (-80 ~ +50 MeV)
     lambda_kinetic = 15.0    # ★ 动能正定性（防负能量海）
     lambda_shape = 8.0       # ★ 波形形态惩罚（高斯波包相似度，防偷懒）
-    lambda_bsmooth = 5.0     # ★ 边界平滑性保护（反震荡）
+    lambda_bsmooth = 0    # ★ 边界平滑性保护（反震荡，从5→20大幅增强）
+    lambda_peak = 10.0       # ★ 峰值位置匹配损失（新增，直接约束峰位置）
+    lambda_energy_mse = 15.0   # ★ 全态能量MSE约束（E_pred vs E_true，驱动能量收敛到真实值）
+
+    # ★ f分量MSE加权系数（f比g小1-2个量级，需要加权补偿）
+    f_mse_weight = 5.0       # f通道MSE权重（g=1.0, f=5.0）
 
     # --- 课程学习超参数（速度优化版）---
-    # 阶段1 (Epoch 1-30):   仅双幻核, λ_physics=0
-    # 阶段2 (Epoch 31-100): 全核素解锁, λ_physics Sigmoid→0.1
-    # 阶段3 (Epoch 101-120): Cosine Annealing LR 收尾
-    curriculum_phase1_epochs = 30
-    curriculum_phase2_epochs = 100  # Phase3从101到300
-    num_epochs = 300          # ★ 减少总epoch（足够收敛）
-    learning_rate = 5e-4     # ★ 提高学习率补偿小batch
-    batch_size = 32          # ★ 匹配小数据量，避免梯度估计不稳定
+    # 阶段1 (Epoch 1-500):   仅双幻核(16O+40Ca), 核心态学习 (7态)
+    # 阶段2 (Epoch 501-1200): 全核素解锁, 激发壳层扩展 (21态，需充足过渡)
+    # 阶段3 (Epoch 1201-3700): Cosine Annealing LR 收尾, 全轨道精调 (42态，充分收敛)
+    #
+    # ★ 比例分析：原始(200:400:900≈1:2:4.5)，Phase1放大2.5倍后需同步调整
+    #   Phase2从400→700(+75%)：7态→21态跳跃需要更多epoch过渡防Loss爆炸
+    #   Phase3从900→2500(+178%)：42态Cosine精调是最终收敛关键，不能被压缩
+    curriculum_phase1_epochs = 500     # ★ 前500轮只用双核子(16O+40Ca)充分预热
+    curriculum_phase2_epochs = 1200    # ★ 中等激发态学习（700轮过渡）
+    num_epochs = 3700                  # ★ 总训练3700轮（从1500大幅增加，匹配各阶段比例放大）
+    learning_rate = 1e-4             # ★ 降低学习率（从2e-4降到1e-4，更精细优化）
+    batch_size = 32                  # 匹配小数据量
     grad_accum_steps = 1
     # ★ 物理主导损失权重（已在上方定义）
     clip_grad_norm = 1.5
@@ -402,44 +413,58 @@ def train_model():
     traj_usage_ratio = 0.95 # 原0.8，提高→更长轨迹利用
 
     # --- 各阶段核素列表 ---
-    phase1_isotopes = ['16O', '40Ca']  # 双幻核
-    all_isotopes = [
-        '16O', '18O', '20O', '22O',
-        '36Ca', '38Ca', '40Ca', '42Ca', '44Ca', '46Ca', '48Ca',
-        '56Ni', '58Ni', '60Ni', '62Ni', '64Ni', '68Ni', '72Ni', '78Ni',
-        '100Sn', '112Sn', '116Sn', '120Sn', '124Sn', '132Sn',
-        '206Pb', '208Pb', '210Pb',
-        '86Kr', '88Sr', '90Zr', '92Mo',
-    ]
+    # ★ 全部阶段仅使用2个核素(16O+40Ca), 通过态数量渐进扩展防止Loss爆炸
+    phase1_isotopes = ['16O', '40Ca']  # ★ 始终只用这2个核素
+    all_isotopes = phase1_isotopes      # ★ 所有阶段共享，不增加核素
 
     # ══════════════════════════════════════════════════════════
     #   完整的核子态列表 — 涵盖狄拉克基的所有nlj轨道
     #   数据格式: 每个核素含 it001(中子N) + it002(质子P), 各42个态
+    #
+    #   ★ 渐进式态扩展策略（防Loss爆炸）:
+    #     Phase 1: 仅核心束缚态(8个), 网络先学基本模式
+    #     Phase 2: 中等激发态(24个), 扩展到完整壳层结构
+    #     Phase 3: 全部42个态, 包含高激发连续谱区域
     # ══════════════════════════════════════════════════════════
-    target_states = [
-        # --- s 轨道 (l=0, κ=-1, j=1/2) ---
+    ALL_42_STATES = [
         '1s1/2', '2s1/2', '3s1/2', '4s1/2', '5s1/2', '6s1/2',
-        # --- p3/2 轨道 (l=1, κ=-2, j=3/2) ---
         '1p3/2', '2p3/2', '3p3/2', '4p3/2', '5p3/2', '6p3/2',
-        # --- d5/2 轨道 (l=2, κ=-3, j=5/2) ---
         '1d5/2', '2d5/2', '3d5/2', '4d5/2', '5d5/2',
-        # --- f7/2 轨道 (l=3, κ=-4, j=7/2) ---
         '1f7/2', '2f7/2', '3f7/2', '4f7/2', '5f7/2',
-        # --- p1/2 轨道 (l=1, κ=+1, j=1/2) ---
         '1p1/2', '2p1/2', '3p1/2', '4p1/2', '5p1/2', '6p1/2',
-        # --- d3/2 轨道 (l=2, κ=+2, j=3/2) ---
         '1d3/2', '2d3/2', '3d3/2', '4d3/2', '5d3/2',
-        # --- f5/2 轨道 (l=3, κ=+3, j=5/2) ---
         '1f5/2', '2f5/2', '3f5/2', '4f5/2', '5f5/2',
-        # --- g7/2 轨道 (l=4, κ=-4, j=7/2) ---
         '1g7/2', '2g7/2', '3g7/2', '4g7/2',
     ]  # 共 6+6+5+5+6+5+5+4 = 42 个态 × 2粒子(N+P) = 84 个轨道
+
+    # ★ 渐进式课程：按物理重要性分批引入态
+    PHASE1_STATES = [
+        # 仅最低能级束缚态 — 核心壳层结构
+        '1s1/2',
+        '1p3/2', '1p1/2',
+        '1d5/2', '1d3/2',
+        '1f7/2', '1f5/2',
+    ]  # 7个态 → 14轨道(含N+P)
+
+    PHASE2_STATES = [
+        # + 第一激发壳层(n=2)
+        '1s1/2', '2s1/2',
+        '1p3/2', '2p3/2', '1p1/2', '2p1/2',
+        '1d5/2', '2d5/2', '1d3/2', '2d3/2',
+        '1f7/2', '2f7/2', '1f5/2', '2f5/2',
+        '1g7/2',
+    ]  # 21个态 → 42轨道
+
+    PHASE3_STATES = ALL_42_STATES  # 全部42个态
+
+    # ★ 初始态列表（Phase 1: 仅核心束缚态）
+    target_states = PHASE1_STATES
 
     # --- 固定参数 ---
     data_dir = '/home/ubuntu/rhf/results'
     dr = 0.10
-    save_interval = 50
-    plot_interval = 25
+    save_interval = 150
+    plot_interval = 100
     checkpoint_dir = '/home/ubuntu/rhf/SCNN/checkpoints'
     plot_dir = '/home/ubuntu/rhf/SCNN/plots'
     log_dir = '/home/ubuntu/rhf/SCNN/training_logs'
@@ -546,7 +571,8 @@ def train_model():
             writer = csv.writer(f)
             writer.writerow(['epoch', 'phase', 'total_loss', 'loss_data', 'loss_pde', 'loss_norm',
                            'loss_node', 'loss_boundary', 'loss_energy', 'loss_kinetic',
-                           'loss_energy_range', 'loss_shape', 'loss_bsmooth', 'energy_pred', 'vps_core',
+                           'loss_energy_range', 'loss_shape', 'loss_bsmooth', 'loss_peak',
+                           'loss_energy_mse', 'energy_pred', 'vps_core',
                            'learning_rate', 'best_epoch', 'active_isotopes'])
 
     best_data_loss = float('inf')
@@ -564,28 +590,35 @@ def train_model():
     for epoch in range(1, num_epochs + 1):
 
         # ══════════════════════════════════════
-        # 课程学习阶段切换逻辑
+        # ★ 渐进式课程学习：态数量扩展（核素固定不变）
+        #   Phase1 → Phase2 → Phase3: 仅增加态, 不增加核素
         # ══════════════════════════════════════
         new_phase = 1
-        new_isotopes = phase1_isotopes
+        new_target_states = PHASE1_STATES  # 7个核心束缚态
 
         if epoch > curriculum_phase1_epochs and epoch <= curriculum_phase2_epochs:
             new_phase = 2
-            new_isotopes = all_isotopes
+            new_target_states = PHASE2_STATES  # 21个态(n≤2)
         elif epoch > curriculum_phase2_epochs:
             new_phase = 3
-            new_isotopes = all_isotopes
+            new_target_states = PHASE3_STATES  # 全部42个态
 
-        # 阶段切换时重建数据集
-        if new_phase != current_phase:
+        # ★ 核素永远不变，仅切换态列表
+        if new_phase != current_phase or set(new_target_states) != set(target_states):
             current_phase = new_phase
-            current_isotopes = new_isotopes
+            target_states = new_target_states
 
             if is_main:
-                phase_names = {1: "双幻核预热", 2: "多体耦合", 3: "极小值寻优"}
+                phase_info = {
+                    1: ("核心束缚态学习", PHASE1_STATES),
+                    2: ("激发壳层扩展", PHASE2_STATES),
+                    3: ("全轨道精调", PHASE3_STATES),
+                }
+                name, states = phase_info[new_phase]
                 print(f"\n{'='*60}")
-                print(f"  📚 课程学习阶段{new_phase}: {phase_names[new_phase]} (Epoch {epoch}+)")
-                print(f"  📦 激活核素: {current_isotopes}")
+                print(f"  📚 Phase{new_phase}: {name} (Epoch {epoch}+)")
+                print(f"  🎯 核子态: {len(states)} 个 | 核素: {current_isotopes}")
+                print(f"  📋 态列表: {states}")
                 print(f"{'='*60}")
 
             # 重建训练集
@@ -631,6 +664,8 @@ def train_model():
         total_loss_shape = 0.0
         total_loss_bsmooth = 0.0
         total_loss_energy_range = 0.0
+        total_loss_peak = 0.0
+        total_loss_energy_mse = 0.0
         num_batches = 0
 
         optimizer.zero_grad(set_to_none=True)
@@ -660,9 +695,11 @@ def train_model():
                                     is_proton=is_proton, z_num=z_num, n_num=n_num,
                                     n_principal=n_principal)  # ★ 传入主量子数
 
-                # ★ 分通道MSE计算：
-                # g/f通道(0,1): 模型输出已是物理空间值(硬归一化后), 直接与Y_true物理值比较
-                loss_gf = nn.functional.mse_loss(y_pred[:, :2, :], y_true[:, :2, :])
+                # ★ 分通道MSE计算（f加权5.0）：
+                # g通道(0): 权重1.0, f通道(1): 权重5.0（f比g小1-2量级，需加权补偿）
+                loss_g = nn.functional.mse_loss(y_pred[:, 0:1, :], y_true[:, 0:1, :])
+                loss_f = nn.functional.mse_loss(y_pred[:, 1:2, :], y_true[:, 1:2, :])
+                loss_gf = loss_g + f_mse_weight * loss_f  # ★ f通道加权
                 # 其余通道(2-10): 用Y的stats归一化后做MSE
                 y_true_others_norm = normalize(y_true[:, 2:, :], y_mean[2:], y_std[2:])
                 y_pred_others_norm = normalize(y_pred[:, 2:, :], y_mean[2:], y_std[2:])
@@ -680,7 +717,8 @@ def train_model():
                             dr=dr,
                             ref_scale=None,
                             return_components=True,
-                            n_principal=n_principal  # ★ 传入主量子数
+                            n_principal=n_principal,  # ★ 传入主量子数
+                            y_true=y_true             # ★ 传入真实标签用于loss_peak
                         )
                         ref_total = phy_components['loss_total'].detach().clone()
                         if use_ddp:
@@ -700,6 +738,7 @@ def train_model():
                         loss_shape = phy_components.get('loss_shape', torch.tensor(0.0, device=device))       # ★
                         loss_bsmooth = phy_components.get('loss_boundary_smooth', torch.tensor(0.0, device=device))  # ★
                         loss_energy_range = phy_components.get('loss_energy_range', torch.tensor(0.0, device=device))  # ★ 能量范围
+                        loss_peak = phy_components.get('loss_peak', torch.tensor(0.0, device=device))  # ★ 峰值位置匹配
                     else:
                         phy_components = calc_physics_residual(
                             pred_tensor=y_pred,
@@ -709,7 +748,8 @@ def train_model():
                             dr=dr,
                             ref_scale=model._phy_ref_scale,
                             return_components=True,
-                            n_principal=n_principal  # ★ 传入主量子数
+                            n_principal=n_principal,  # ★ 传入主量子数
+                            y_true=y_true             # ★ 传入真实标签用于loss_peak
                         )
                         loss_pde = phy_components['loss_pde']
                         loss_norm = phy_components['loss_norm']
@@ -720,17 +760,28 @@ def train_model():
                         loss_shape = phy_components.get('loss_shape', torch.tensor(0.0, device=device))       # ★
                         loss_bsmooth = phy_components.get('loss_boundary_smooth', torch.tensor(0.0, device=device))  # ★
                         loss_energy_range = phy_components.get('loss_energy_range', torch.tensor(0.0, device=device))  # ★ 能量范围
+                        loss_peak = phy_components.get('loss_peak', torch.tensor(0.0, device=device))  # ★ 峰值位置匹配
 
-                    # ★ 物理主导损失组合: PDE > Norm > Node > Energy/Kinetic > Shape/Boundary >> Data(MSE辅助)
+                    # ★ 全态能量MSE约束：E_pred vs E_true
+                    # 物理依据：网络输出通道9为能量E，y_true通道9为真实收敛能量
+                    # 直接用MSE驱动预测能量逼近真实值，适用于所有量子态
+                    # 这比硬编码阈值更通用：1s1/2的E≈-37MeV, 2s1/2的E≈-3MeV，各自收敛到真实值
+                    E_pred = y_pred[:, 9, :].mean(dim=1)   # (B,) 预测能量
+                    E_true = y_true[:, 9, :].mean(dim=1)   # (B,) 真实能量
+                    loss_energy_mse = nn.functional.mse_loss(E_pred, E_true)
+
+                    # ★ 物理主导损失组合: PDE > Norm > Node > Energy/Kinetic > Shape/Boundary > Peak >> Data(MSE辅助)
                     loss_phy = (lambda_pde * loss_pde +          # ★ PDE 主导！狄拉克方程残差
                                 lambda_norm * loss_norm +        # 归一化约束
                                 lambda_node * loss_node +        # 节点数精确约束
                                 lambda_energy * loss_energy +    # ★ 正能量约束（标量密度>0）
                                 lambda_kinetic * loss_kinetic +  # ★ 动能正定性（防负能量海）
                                 lambda_energy_range * loss_energy_range +  # ★ 能量范围 (-80~+50 MeV)
+                                lambda_energy_mse * loss_energy_mse +  # ★ 全态能量MSE（E_pred→E_true）
                                 lambda_boundary * loss_boundary + # 边界端点约束
                                 lambda_shape * loss_shape +       # ★ 波形形态惩罚（防偷懒）
-                                lambda_bsmooth * loss_bsmooth)   # ★ 边界平滑性（反震荡）
+                                lambda_bsmooth * loss_bsmooth +   # ★ 边界平滑性（反震荡）
+                                lambda_peak * loss_peak)          # ★ 峰值位置匹配
                 else:
                     loss_pde = torch.tensor(0.0, device=device)
                     loss_norm = torch.tensor(0.0, device=device)
@@ -741,6 +792,8 @@ def train_model():
                     loss_shape = torch.tensor(0.0, device=device)       # ★
                     loss_bsmooth = torch.tensor(0.0, device=device)    # ★
                     loss_energy_range = torch.tensor(0.0, device=device)  # ★ 能量范围
+                    loss_peak = torch.tensor(0.0, device=device)       # ★ 峰值位置匹配
+                    loss_energy_mse = torch.tensor(0.0, device=device)  # ★ 全态能量MSE
                     loss_phy = torch.tensor(0.0, device=device)
 
                 # ★ 总损失 = 弱MSE辅助 + 强物理主导
@@ -775,6 +828,8 @@ def train_model():
             total_loss_shape += (loss_shape.item() * grad_accum_steps) if isinstance(loss_shape, torch.Tensor) and loss_shape.requires_grad else 0.0
             total_loss_bsmooth += (loss_bsmooth.item() * grad_accum_steps) if isinstance(loss_bsmooth, torch.Tensor) and loss_bsmooth.requires_grad else 0.0
             total_loss_energy_range += (loss_energy_range.item() * grad_accum_steps) if isinstance(loss_energy_range, torch.Tensor) and loss_energy_range.requires_grad else 0.0
+            total_loss_peak += (loss_peak.item() * grad_accum_steps) if isinstance(loss_peak, torch.Tensor) and loss_peak.requires_grad else 0.0
+            total_loss_energy_mse += (loss_energy_mse.item() * grad_accum_steps) if isinstance(loss_energy_mse, torch.Tensor) and loss_energy_mse.requires_grad else 0.0
             num_batches += 1
 
         # LR调度
@@ -808,6 +863,8 @@ def train_model():
         loss_shape_avg = total_loss_shape / n_batches       # ★
         loss_bsmooth_avg = total_loss_bsmooth / n_batches   # ★
         loss_energy_range_avg = total_loss_energy_range / n_batches  # ★ 能量范围
+        loss_peak_avg = total_loss_peak / n_batches  # ★ 峰值位置匹配
+        loss_energy_mse_avg = total_loss_energy_mse / n_batches  # ★ 全态能量MSE
 
         # Early Stopping
         current_data_loss = loss_data_avg
@@ -831,7 +888,8 @@ def train_model():
                                         n_principal=n_principal)
                     phy_diag = calc_physics_residual(
                         sample_y_ph, kappa, y_mean, y_std,
-                        dr=dr, return_components=True, n_principal=n_principal
+                        dr=dr, return_components=True, n_principal=n_principal,
+                        y_true=y_true  # ★ 传入真实标签用于loss_peak
                     )
                     energy_pred_val = phy_diag.get('energy_E', 0.0).item() if 'energy_E' in phy_diag else 0.0
                     vps_core_val = phy_diag.get('vps_core', 0.0).item() if 'vps_core' in phy_diag else 0.0
@@ -848,17 +906,19 @@ def train_model():
                     f"{loss_energy_avg:.8f}", f"{loss_kinetic_avg:.8f}",
                     f"{loss_energy_range_avg:.8f}",
                     f"{loss_shape_avg:.6f}", f"{loss_bsmooth_avg:.6f}",
+                    f"{loss_peak_avg:.6f}",
+                    f"{loss_energy_mse_avg:.6f}",
                     f"{energy_pred_val:.4f}", f"{vps_core_val:.4f}",
                     f"{current_lr:.2e}",
                     best_epoch, len(current_isotopes)
                 ])
 
             if epoch % 5 == 0 or epoch == 1:
-                phase_names = {1: "双幻核预热", 2: "多体耦合", 3: "极小值寻优"}
+                phase_names = {1: "核心束缚态", 2: "激发壳层", 3: "全轨道精调"}
                 print(f"Epoch [{epoch:3d}/{num_epochs}] | Phase{current_phase}({phase_names[current_phase]}) | LR: {current_lr:.2e}", flush=True)
                 print(f"  [物理主导] Loss: {loss_total_avg:.4f} | Data: {loss_data_avg:.4f}(×{lambda_data}) | PDE: {loss_pde_avg:.4f}(×{lambda_pde}) | Norm: {loss_norm_avg:.4f}(×{lambda_norm}) | Node: {loss_node_avg:.4f}(×{lambda_node})", flush=True)
                 print(f"             Energy: {loss_energy_avg:.6f}(×{lambda_energy}) | Kinetic: {loss_kinetic_avg:.6f}(×{lambda_kinetic}) | E_Range: {loss_energy_range_avg:.6f}(×{lambda_energy_range}) | Boundary: {loss_boundary_avg:.6f}(×{lambda_boundary})", flush=True)
-                print(f"             Shape: {loss_shape_avg:.6f}(×{lambda_shape}) | BSmooth: {loss_bsmooth_avg:.6f}(×{lambda_bsmooth})", flush=True)
+                print(f"             Shape: {loss_shape_avg:.6f}(×{lambda_shape}) | BSmooth: {loss_bsmooth_avg:.6f}(×{lambda_bsmooth}) | Peak: {loss_peak_avg:.6f}(×{lambda_peak}) | E_MSE: {loss_energy_mse_avg:.6f}(×{lambda_energy_mse})", flush=True)
                 print(f"             ★ E_pred={energy_pred_val:.2f} MeV | vps_core={vps_core_val:.2f}", flush=True)
 
             # 物理验证

@@ -4,6 +4,69 @@ import torch.nn.functional as F
 import math
 
 
+# ═══════════════════════════════════════════════════════════════
+#   Sobolev 平滑正则化层 — 消除波函数高频锯齿
+#   核心：可学习的1D深度可分离卷积 + 残差连接
+#   初始化为 Binomial-5 平滑核 [1,4,6,4,1]/16，训练中可微调
+#   残差连接确保平滑层不会退化波形（恒等映射是初始解）
+# ═══════════════════════════════════════════════════════════════
+
+class SobolevSmoother(nn.Module):
+    """
+    Sobolev空间正则化平滑层 (H^1 正则化)
+
+    物理动机：
+      狄拉克方程的束缚态解属于 H^1 空间（函数 + 一阶导数都连续），
+      但FNO的频域截断会在高频端产生Gibbs震荡 → 锯齿状波函数。
+      本层通过可学习的局部平滑卷积，从架构层面保证输出光滑性。
+
+    设计选择：
+      - 深度可分离卷积 (groups=channels): g和f独立平滑，互不干扰
+      - 残差连接: smooth(x) = conv(x) + x，初始时conv(x)≈0（近恒等）
+      - 初始化为 Binomial-5 核 [1,4,6,4,1]/16:
+          二项展开系数，保证归一化且对称，是最优的5点平滑核
+    """
+    def __init__(self, channels=2, kernel_size=5):
+        super().__init__()
+        self.channels = channels
+        self.kernel_size = kernel_size
+        padding = kernel_size // 2  # 保持序列长度不变
+
+        # 深度可分离卷积: 每个通道独立卷积
+        self.conv = nn.Conv1d(
+            channels, channels, kernel_size,
+            padding=padding, groups=channels, bias=False
+        )
+
+        # ★ 初始化为 Binomial-5 平滑核 [1,4,6,4,1]/16
+        # 此核是5点高斯平滑的最优离散近似，频率响应单调递减
+        with torch.no_grad():
+            binomial_5 = torch.tensor([1.0, 4.0, 6.0, 4.0, 1.0]) / 16.0
+            # 深度可分离: 每个通道用相同的平滑核
+            weight = binomial_5.unsqueeze(0).unsqueeze(0).expand(channels, 1, -1).clone()
+            self.conv.weight.data = weight
+
+        # ★ 可学习的残差缩放因子，初始为0（恒等映射）
+        # 训练中网络可以学习到：smooth_out = conv(x) * alpha + x
+        # alpha从0开始，意味着初始时平滑层不做任何事
+        # 随着训练进行，如果需要平滑，alpha会逐渐增大
+        self.residual_alpha = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        """
+        x: (B, channels, N) — 通常是 (B, 2, N) 即 [g, f]
+        返回: (B, channels, N) — 平滑后的波函数
+        """
+        # conv(x) 是平滑后的结果，但初始时权重为 Binomial 核
+        # 通过 residual_alpha 控制平滑强度：
+        #   alpha=0 → 恒等映射（不改变原始输出）
+        #   alpha>0 → 逐渐引入平滑
+        smoothed = self.conv(x)
+        # 残差连接: 输出 = 原始 + alpha * (平滑修正量)
+        # 平滑修正量 = smoothed - x ≈ 二阶导数的离散近似（低通滤波残差）
+        return x + self.residual_alpha * (smoothed - x)
+
+
 class SpectralConv1d(nn.Module):
     """
     一维傅里叶神经算子 (FNO) 核心层
@@ -291,8 +354,14 @@ class RHF_FNO_GRU(nn.Module):
         self.alpha_net = nn.Sequential(
             nn.Linear(gru_hidden, 64),
             nn.GELU(),
-            nn.Linear(64, 2),
+            nn.Linear(64, 1),  # ★ 仅输出 alpha_g（1维），alpha_f 由 alpha_g + f_alpha_offset 推导
         )
+
+        # ★ f 分量独立衰减偏移量（可学习）
+        # 物理动机：小分量 f 的渐近行为由 (κ/r + V) 决定，比大分量 g 衰减更快
+        # alpha_f = alpha_g * (1 + softplus(f_alpha_offset))
+        # 初始值=0.5 → softplus(0.5)≈0.97 → alpha_f ≈ 1.97 * alpha_g，f衰减约2倍快
+        self.f_alpha_offset = nn.Parameter(torch.tensor(0.5))
 
         # --- 6. 进度投影层（正式初始化，不再懒初始化）---
         self._progress_proj = nn.Linear(self.gru_input_size + 1, self.gru_input_size, bias=False)
@@ -304,6 +373,11 @@ class RHF_FNO_GRU(nn.Module):
         # --- 7. 波函数特征投影 (用于物理交叉注意力维度匹配) ---
         self._wavefunc_proj = nn.Linear(self.hidden_dim, gru_hidden, bias=False)
         nn.init.normal_(self._wavefunc_proj.weight, std=0.01)
+
+        # --- 8. Sobolev 平滑正则化层 (消除锯齿) ---
+        # 在 ansatz mask 之后、硬归一化之前对 g/f 做可学习平滑
+        # channels=2 对应 g 和 f 两个通道
+        self.sobolev_smooth = SobolevSmoother(channels=2, kernel_size=5)
 
     def _normalize_zn(self, z_num, n_num):
         """将 (Z, N) 归一化到 [0, 1] 附近，便于 MLP 学习"""
@@ -436,9 +510,14 @@ class RHF_FNO_GRU(nn.Module):
         raw_f = pred_x[:, 1, :]
 
         # 预测衰减系数
-        alphas_raw = self.alpha_net(enhanced_hidden)
-        alphas = 0.1 + 2.9 * torch.sigmoid(alphas_raw)  # ★ alpha ∈ [0.1, 3.0] 增强远场衰减
-        alpha_g, alpha_f = alphas[:, 0].unsqueeze(1), alphas[:, 1].unsqueeze(1)
+        alpha_g_raw = self.alpha_net(enhanced_hidden)  # (B, 1) — 仅预测 alpha_g
+        alpha_g = (0.1 + 2.9 * torch.sigmoid(alpha_g_raw)).squeeze(-1)  # ★ alpha_g ∈ [0.1, 3.0]
+        # ★ 分离衰减：alpha_f = alpha_g * (1 + softplus(f_alpha_offset))
+        # 物理保证：f 的远场衰减速度始终 > g，softplus确保偏移量>0
+        alpha_f = alpha_g * (1.0 + F.softplus(self.f_alpha_offset))  # (B,)
+        # 扩展为 (B, 1) 以便后续广播
+        alpha_g = alpha_g.unsqueeze(1)
+        alpha_f = alpha_f.unsqueeze(1)
         kappa_exp = kappa.abs().unsqueeze(1)
 
         # ★ 增强远场衰减：在 r > 15fm 区域施加更强的指数压制
@@ -488,6 +567,14 @@ class RHF_FNO_GRU(nn.Module):
         g_constrained = raw_g * ansatz_mask_g
         f_constrained = raw_f * ansatz_mask_f
 
+        # ===== ★ Sobolev 平滑正则化 (消除锯齿) =====
+        # 在 ansatz mask 之后、归一化之前对 g/f 做可学习平滑
+        # 将 g,f 堆叠为 (B, 2, N) 输入 SobolevSmoother
+        gf_constrained = torch.stack([g_constrained, f_constrained], dim=1)  # (B, 2, N)
+        gf_smoothed = self.sobolev_smooth(gf_constrained)  # (B, 2, N)
+        g_constrained = gf_smoothed[:, 0, :]
+        f_constrained = gf_smoothed[:, 1, :]
+
         # ===== 硬狄拉克归一化 =====
         g_sq = g_constrained ** 2
         f_sq = f_constrained ** 2
@@ -505,7 +592,7 @@ class RHF_FNO_GRU(nn.Module):
         # ===== 硬约束：防止 f 分量被偷懒置零 =====
         # 物理事实：狄拉克束缚态的 f/g 比例在核内区域通常为 5%~30%
         # 如果 ∫f² / ∫(g²+f²) < f_min_ratio，强制提升 f 的幅度
-        f_min_ratio = 0.05  # f至少贡献5%的概率密度
+        f_min_ratio = 0.15  # ★ f至少贡献15%的概率密度（从0.05提升，确保f分量不被忽略）
         f_power_frac = (f_normalized ** 2).sum(dim=-1, keepdim=True) * dr_val  # (B,1)
         # f_power_frac 应该在 [0, 1] 范围（因为已归一化）
         f_deficit = torch.clamp(f_min_ratio - f_power_frac, min=0.0)  # (B,1)

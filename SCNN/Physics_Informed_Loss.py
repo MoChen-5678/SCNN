@@ -6,11 +6,12 @@ _ref_scale = None
 
 def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
                           dr=0.10, ref_scale=None, return_components=True,
-                          n_principal=None):
+                          n_principal=None, y_true=None):
     """
     计算狄拉克方程的物理残差，返回可独立加权的分量。
 
     ★ 加强版：引入主量子数 n_principal 做精确节点数约束
+    ★ 新增：峰值位置匹配损失 loss_peak（需要 y_true）
 
     参数：
     ------
@@ -21,11 +22,12 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     ref_scale: 物理损失参考尺度（用于归一化，None则不缩放）
     return_components: True返回dict，False返回标量
     n_principal: (B,) ★ 主量子数，用于精确节点数约束
+    y_true: (B, 11, N) ★ 真实标签（可选），用于峰值位置匹配损失
 
     返回值：
     ------
     return_components=True:
-        dict: {loss_pde, loss_norm, loss_amplitude, norm_integral, loss_total, loss_node}
+        dict: {loss_pde, loss_norm, loss_amplitude, norm_integral, loss_total, loss_node, loss_peak}
     return_components=False:
         标量总物理损失
     """
@@ -62,14 +64,17 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     u2f = r1 + vtt + YF
     u2g = E_hc - vps - YG
 
-    # 4. 计算内部网格点的一阶微商 (中心差分)
-    dg_dr = (g[:, 2:] - g[:, :-2]) / (2 * dr)
-    df_dr = (f[:, 2:] - f[:, :-2]) / (2 * dr)
+    # 4. 计算内部网格点的一阶微商 (★ 4阶中心差分，精度O(dr⁴))
+    # 2阶: f'(x) ≈ (f[i+1] - f[i-1]) / (2*dr)         误差 O(dr²)=O(0.01)
+    # 4阶: f'(x) ≈ (-f[i+2]+8f[i+1]-8f[i-1]+f[i-2]) / (12*dr)  误差 O(dr⁴)=O(0.0001)
+    # 内部点范围: [2:-2]（跳过两端各2个点）
+    dg_dr = (-g[:, 4:] + 8.0 * g[:, 3:-1] - 8.0 * g[:, 1:-3] + g[:, :-4]) / (12.0 * dr)
+    df_dr = (-f[:, 4:] + 8.0 * f[:, 3:-1] - 8.0 * f[:, 1:-3] + f[:, :-4]) / (12.0 * dr)
 
-    # 截取内部点对齐
-    g_int, f_int = g[:, 1:-1], f[:, 1:-1]
-    u1g_int, u1f_int = u1g[:, 1:-1], u1f[:, 1:-1]
-    u2f_int, u2g_int = u2f[:, 1:-1], u2g[:, 1:-1]
+    # 截取内部点对齐（4阶差分跳过两端各2个点，所以内部点范围是 [2:-2]）
+    g_int, f_int = g[:, 2:-2], f[:, 2:-2]
+    u1g_int, u1f_int = u1g[:, 2:-2], u1f[:, 2:-2]
+    u2f_int, u2g_int = u2f[:, 2:-2], u2g[:, 2:-2]
 
     # ================================================================
     #   约束 1：狄拉克方程 PDE 残差 ★ 加强版
@@ -81,13 +86,14 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     Rf = df_dr - (u2f_int * f_int - u2g_int * g_int)
 
     # 径向测度压制奇点 (r→0 时 κ/r 发散)
-    r_int = r[:, 1:-1]
+    r_int = r[:, 2:-2]
     Rg_weighted = Rg * r_int  # 自然压制近核区发散
     Rf_weighted = Rf * r_int
 
     # ★ 不再自适应缩放！直接用绝对残差平方
-    # 这样当波函数偏离狄拉克方程解时，梯度信号会很强
-    loss_pde = torch.mean(Rg_weighted ** 2 + Rf_weighted ** 2) * dr
+    # ★ Rf 加权 3.0：f 分量比 g 小 1-2 个量级，MSE 天然偏好 g
+    #   加权补偿确保 f 的 PDE 约束信号不会被 g 掩盖
+    loss_pde = torch.mean(Rg_weighted ** 2 + 3.0 * Rf_weighted ** 2) * dr
 
     # ================================================================
     #   约束 2：狄拉克归一化条件 ∫[g(r)² + f(r)²] dr = 1
@@ -219,10 +225,11 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     #
     #   负能量海/震荡假解 → 纯动能 < 0 → 重罚
     # ================================================================
+    # ★ 4阶差分后 dg_dr/df_dr 长度为 N-4，填充到 dg_full/df_full 时需要对应 [2:-2]
     dg_full = torch.zeros_like(g)
     df_full = torch.zeros_like(f)
-    dg_full[:, 1:-1] = dg_dr
-    df_full[:, 1:-1] = df_dr
+    dg_full[:, 2:-2] = dg_dr
+    df_full[:, 2:-2] = df_dr
 
     # 纯动能被积函数：无大常数，量级安全
     kin_term_diff = -g * df_full + f * dg_full                    # 微分项
@@ -253,6 +260,11 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
 
         核心思想：物理波函数的包络从峰值向外单调递减（类高斯），
         如果预测波形违反这一基本特征，施加大权重惩罚。
+
+        ★ 修复版：
+          - 曲率约束权重从0.1提升到1.0（原值太小导致loss_shape≈0）
+          - 尾部阈值从5%降到2%（归一化后波形尾部概率极低）
+          - 新增全区间二阶TV惩罚（高阶差分L1范数，捕捉锯齿）
         """
         prob = g_sig ** 2 + f_sig ** 2  # (B, L)
 
@@ -283,28 +295,40 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
         mono_violation = torch.clamp(env_diff * right_diff_mask, min=0) ** 2
         loss_mono = torch.mean(mono_violation) * 10.0  # 放大权重
 
-        # --- b) 光滑性（二阶导数 / 曲率约束）---
+        # --- b) 光滑性（曲率约束 + ★ 高阶TV惩罚）---
         # 物理波函数除节点外光滑连续；震荡解的二阶导数出现尖刺
         d2g = g_sig[:, 2:] - 2 * g_sig[:, 1:-1] + g_sig[:, :-2]
         d2f = f_sig[:, 2:] - 2 * f_sig[:, 1:-1] + f_sig[:, :-2]
         # 曲率的平方均值 — 震荡解此项极大
         roughness_g = torch.mean(d2g ** 2)
         roughness_f = torch.mean(d2f ** 2)
-        loss_smooth = (roughness_g + roughness_f) * 0.1  # 缩放到合理量级
+        # ★ 曲率权重从0.1提升到1.0（原值太小导致loss_shape始终≈0）
+        loss_smooth = (roughness_g + roughness_f) * 1.0
+
+        # ★ 新增：全区间二阶TV惩罚（三阶差分的L1范数）
+        # 物理含义：真正的波函数三阶导数有界，锯齿/震荡的三阶导数异常大
+        # d³g/dr³ ≈ g[i+2] - 2g[i+1] + 2g[i-1] - g[i-2]  (中心差分)
+        if npt > 4:
+            d3g = g_sig[:, 4:] - 2*g_sig[:, 3:-1] + 2*g_sig[:, 1:-3] - g_sig[:, :-4]
+            d3f = f_sig[:, 4:] - 2*f_sig[:, 3:-1] + 2*f_sig[:, 1:-3] - f_sig[:, :-4]
+            loss_higher_tv = (torch.mean(torch.abs(d3g)) + torch.mean(torch.abs(d3f))) * 0.5
+        else:
+            loss_higher_tv = torch.tensor(0.0, device=device)
 
         # --- c) 尾部集中性 ---
         tail_start = min(int(10.0 / dr_val), npt - 1)  # r > 10fm 为尾部
         if tail_start < npt - 1:
             total_prob = prob.sum(dim=-1, keepdim=True) * dr_val  # (B, 1)
             tail_prob = prob[:, tail_start:].sum(dim=-1, keepdim=True) * dr_val  # (B, 1)
-            # 束缚态尾部概率占比应 < 5%（指数衰减）
+            # ★ 束缚态尾部概率占比应 < 2%（从5%降低，指数衰减更快）
+            # 归一化后波形尾部概率极低，5%阈值太宽松
             tail_ratio = tail_prob / (total_prob.clamp(min=1e-10))
             # 超过阈值时惩罚，超得越多罚越重
-            loss_tail = torch.mean(torch.clamp(tail_ratio - 0.05, min=0) ** 2) * 50.0
+            loss_tail = torch.mean(torch.clamp(tail_ratio - 0.02, min=0) ** 2) * 50.0
         else:
             loss_tail = torch.tensor(0.0, device=device)
 
-        return loss_mono + loss_smooth + loss_tail
+        return loss_mono + loss_smooth + loss_higher_tv + loss_tail
 
 
     # ================================================================
@@ -330,6 +354,67 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     loss_energy_range = torch.mean((below_low ** 2 + above_high ** 2)) * 0.01
 
     loss_shape = _waveform_shape_penalty(g, f, r, dr)
+
+    # ================================================================
+    #   ★ 约束 8.6：峰值位置匹配损失 (loss_peak)
+    #
+    #   物理动机：波函数峰位置偏移是当前模型的核心问题之一
+    #     - 1s1/2 态: g 峰应在 r ≈ 0.5-1.0 fm
+    #     - 2s1/2 态: g 主峰应在 r ≈ 1.5-2.5 fm
+    #     - 如果峰位置偏移，即使归一化正确，波函数的物理意义也完全错误
+    #
+    #   实现：soft-argmax（可微的加权均值峰值位置检测）
+    #     - 相比 argmax（不可微），soft-argmax 通过 softmax 权重计算
+    #       峰值位置的连续期望值，梯度可传
+    #     - temperature 控制峰值检测的锐度：温度越低越接近 argmax
+    # ================================================================
+    if y_true is not None:
+        # 从真实标签中提取 g 的参考峰值位置
+        g_true = y_true[:, 0, :]  # (B, N)
+
+        # soft-argmax: 可微峰值位置检测
+        def _soft_peak_position(signal, r_grid_local, temperature=0.1):
+            """
+            可微的峰值位置检测 (soft-argmax)。
+
+            原理：用 softmax(signal/τ) 生成权重，对 r_grid 做加权平均。
+            当 τ→0 时趋近于 argmax（不可微），τ>0 时平滑可微。
+
+            参数：
+                signal: (B, N) 信号
+                r_grid_local: (B, N) 径向网格
+                temperature: 锐度参数，越小越接近 argmax
+            返回：
+                (B,) 每个样本的峰值径向位置
+            """
+            # 跳过近核区(r<0.5fm)，避免噪声峰
+            search_start = max(1, int(0.5 / dr_val_global))
+            signal_search = signal[:, search_start:]
+            r_search = r_grid_local[:, search_start:]
+
+            # softmax 权重
+            weights = torch.softmax(signal_search / temperature, dim=-1)  # (B, N-search_start)
+            # 加权平均得到峰值位置
+            peak_pos = (weights * r_search).sum(dim=-1)  # (B,)
+            return peak_pos
+
+        dr_val_global = dr  # 供内部函数使用
+
+        # 检测真实和预测的峰值位置
+        r_for_peak = r.clone()  # (B, N)
+        # 对 g 取绝对值后再做 soft-argmax（峰无论正负都应该被检测到）
+        peak_pos_pred = _soft_peak_position(torch.abs(g), r_for_peak, temperature=0.1)
+        peak_pos_true = _soft_peak_position(torch.abs(g_true), r_for_peak, temperature=0.1)
+
+        # smooth L1 损失：对小偏差线性惩罚，对大偏差平方惩罚（比L2更鲁棒）
+        peak_diff = torch.abs(peak_pos_pred - peak_pos_true)
+        loss_peak = torch.mean(torch.where(
+            peak_diff < 1.0,  # 1 fm 阈值
+            0.5 * peak_diff ** 2,  # 小偏差：L2
+            peak_diff - 0.5         # 大偏差：L1（避免过大梯度）
+        ))
+    else:
+        loss_peak = torch.tensor(0.0, device=device)
 
     # ================================================================
     #   ★ 约束 9：远场边界保护（反震荡机制）
@@ -549,6 +634,7 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
             'loss_kinetic_positive': loss_kinetic_positive,
             'loss_energy_range': loss_energy_range,      # ★ 新增：能量范围惩罚 (-80~-50 MeV)
             'loss_shape': loss_shape,                    # ★ 新增：波形形态惩罚
+            'loss_peak': loss_peak,                      # ★ 新增：峰值位置匹配损失
             'loss_boundary_smooth': loss_boundary_smooth,# ★ 新增：边界平滑性（可单独监控）
             'norm_integral': norm_integral.detach().mean(),
             'energy_E': E_mean,                           # ★ 新增：能量值
@@ -557,7 +643,7 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
             'loss_total': (loss_pde + loss_norm + loss_amplitude + loss_node_anomaly
                            + loss_boundary_total + loss_positive_energy
                            + loss_kinetic_positive + loss_energy_range
-                           + loss_shape),
+                           + loss_shape + loss_peak),
         }
         if ref_scale is not None and ref_scale > 0:
             # ★ PDE/Norm 不做任何缩放！原始值直接输出
@@ -569,6 +655,7 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
                 'loss_boundary': loss_boundary_total,
                 'loss_energy_range': loss_energy_range,      # ★ 新增
                 'loss_shape': loss_shape / ref_scale,
+                'loss_peak': loss_peak,                       # ★ 新增：峰值位置匹配（不缩放，物理单位fm）
                 'loss_boundary_smooth': loss_boundary_smooth / ref_scale,
                 'loss_positive_energy': loss_positive_energy,
                 'loss_kinetic_positive': loss_kinetic_positive,
@@ -582,6 +669,7 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
                                     + scaled['loss_boundary']
                                     + scaled['loss_energy_range']
                                     + scaled['loss_shape']
+                                    + scaled['loss_peak']
                                     + scaled['loss_positive_energy']
                                     + scaled['loss_kinetic_positive'])
             return scaled
@@ -590,7 +678,7 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
         loss_physics = (loss_pde + loss_norm + loss_amplitude
                         + loss_node_anomaly + loss_boundary_total
                         + loss_positive_energy + loss_kinetic_positive
-                        + loss_shape)
+                        + loss_shape + loss_peak)
         if ref_scale is not None and ref_scale > 0:
             loss_physics = loss_physics / ref_scale
         return loss_physics
