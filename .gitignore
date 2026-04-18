@@ -23,3 +23,5 @@ plots/*.png
 # IDE 配置
 .vscode/
 .idea/
+
+.codebuddy/
