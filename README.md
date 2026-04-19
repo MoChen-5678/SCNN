@@ -131,8 +131,7 @@ get_cached_fd_matrix_5padf(n, dr, direction, device)
 # Rayleigh梯度阻断：能量读数器detach()，阻止误差回传波函数
 loss_energy_rayleigh = torch.mean((E_net - E_rayleigh.detach()) ** 2)
 
-# 训练期禁用相位翻转：PDE对全局符号免疫，自然坍缩
-# g_aligned, f_aligned = _align_phase(g, f)  # 已禁用
+# 相位对齐：确保波函数全局相位一致（G的第一个显著峰>0）
 ```
 
 ### Train.py
@@ -169,7 +168,6 @@ loss_energy_rayleigh = torch.mean((E_net - E_rayleigh.detach()) ** 2)
 ### v9: 三重致命谬误修复
 1. **FD矩阵O(N³)瓶颈**：全局缓存，6处调用全走缓存，速度提升10~50x
 2. **能量-波函数死循环**：Rayleigh loss用`.detach()`阻断，打破Moving Target不稳定性
-3. **相位拓扑翻转**：训练期禁用_align_phase，推理阶段再对齐
 
 ## 输出与可视化
 
@@ -198,7 +196,6 @@ loss_energy_rayleigh = torch.mean((E_net - E_rayleigh.detach()) ** 2)
 ### v9 (2026-04-19)
 - **修复**: FD矩阵全局缓存，训练速度10~50x提升
 - **修复**: Rayleigh梯度阻断，消除能量-波函数死循环
-- **修复**: 训练期禁用相位翻转，避免拓扑翻转
 
 ### v8 (2026-04-19)
 - **修复**: 相对论多尺度重整化，架构层F尺度注入+残差200x均衡
