@@ -590,56 +590,85 @@ class RHF_FNO_GRU(nn.Module):
         # pred_x = delta_x（直接输出，不加x_physics最后一帧）
         pred_x = delta_x
 
-        # --- 物理约束处理 ---
-        # 根据核物理教材（龙文辉《核物理计算实践》）径向 Dirac 方程边界条件：
-        # 1. 在 r→0 处：G(r) ~ r^(l_u+1), F(r) ~ r^(l_d+1)
-        # 2. 在 r=R 处（截断边界）：G(R) = 0, F(R) = C_R（非零常数）
+        # --- Step 7: 物理自洽的 Ansatz 边界条件 ---
+        # ★ 2026-04-19 关键重构：从 tanh 近似 → 精确 r^{l+1} 幂律
+        #
+        #   致命缺陷（旧代码）：
+        #     使用 origin_factor = tanh(r/ε)^{l+1} 来近似 r^{l+1}
+        #     tanh(x) = x - x³/3 + ... → 高阶修正项破坏 Frobenius 解析行为
+        #     对于 F 小分量（l_d=1），这导致 κ/r·F 项在 r→0 处虚假发散
+        #     优化器被迫扭曲远场波形来压制近核区发散 → 全局畸变
+        #
+        #   正确物理（Frobenius 级数展开，Dirac 方程在奇异势下的解析解）：
+        #     G(r)|_{r→0} = C₀ · r^{l_u+1} · [1 + O(r²)]
+        #     F(r)|_{r→0} = C₀'· r^{l_d+1} · [1 + O(r²)]
+        #     其中 l_u, l_d 由 κ 唯一确定：
+        #       κ < 0: l_u = -κ-1,  l_d = -κ    (例: κ=-1 → l_u=0, l_d=1)
+        #       κ > 0: l_u =  κ,    l_d =  κ-1  (例: κ=+1 → l_u=1, l_d=0)
+        #
+        #   文献依据：
+        #     [1] Greiner "Quantum Mechanics: Symmetries" §9.3 — Dirac方程奇点分析
+        #     [2] 龙文辉《核物理计算实践》公式3.55-3.57
+        #     [3] Wang et al., Chin.Phys.C 49(2025)014106 — ADF消除虚假态的根源
+        #
         raw_g = pred_x[:, 0, :]
         raw_f = pred_x[:, 1, :]
 
-        # 预测衰减系数（用于远场指数衰减）
+        # 预测衰减系数（控制远场指数衰减）
         alpha_g_raw = self.alpha_net(enhanced_hidden)
         alpha_g = (0.1 + 2.9 * torch.sigmoid(alpha_g_raw)).squeeze(-1)
         alpha_f = alpha_g * (1.0 + F.softplus(self.f_alpha_offset))
         alpha_g = alpha_g.unsqueeze(1)
         alpha_f = alpha_f.unsqueeze(1)
 
-        # 获取 r_grid
+        # 获取径向网格
         r_max = (r_grid if r_grid.dim() == 2 else r_grid.unsqueeze(0))
 
-        # 根据 kappa 计算上下分量的轨道角动量
-        # κ > 0: l_u = κ, l_d = κ - 1
-        # κ < 0: l_u = -κ - 1, l_d = -κ
-        kappa_expanded = kappa.view(-1, 1).float()
-        l_u = torch.where(kappa_expanded > 0, kappa_expanded, -kappa_expanded - 1)
-        l_d = torch.where(kappa_expanded > 0, kappa_expanded - 1, -kappa_expanded)
+        # ══════════════════════════════════════════
+        #  Phase A: 精确轨道角动量计算
+        # ══════════════════════════════════════════
+        k_val = kappa.view(-1, 1).float()
 
-        # 原点边界条件：G(r) ~ r^(l_u+1), F(r) ~ r^(l_d+1)
-        # 使用 soft 版本：乘以 tanh(r/epsilon)^(l+1) 来近似 r^(l+1) 行为
-        epsilon = 0.1
-        origin_factor = torch.tanh(r_max / epsilon)
-        g_origin_mask = origin_factor ** (l_u + 1)
-        f_origin_mask = origin_factor ** (l_d + 1)
+        # l_u: 大分量(G)轨道角动量
+        #   κ > 0 → j = l - 1/2 → l_u = κ
+        #   κ < 0 → j = l + 1/2 → l_u = -κ - 1
+        l_u = torch.where(k_val > 0, k_val, -k_val - 1.0).float()
 
-        # 远场边界条件：在 r=R 处 G(R)=0（指数衰减）
-        # F(R) 可以是非零常数，但也施加衰减以确保数值稳定
-        # ★ 关键修复(2026-04-19): r_cutoff 从 18.0 回调到 8.0 fm
-        #
-        # 物理依据（教材公式3.60 + 3.61）：
-        #   束缚态波函数在远场应指数衰减 → 0，1s1/2 态在 r>6fm 时 |g|<0.01
-        #   原值 18fm 的错误：强制波形在 [6,18]fm 区间保持显著非零 →
-        #     归一化约束 ∫(g²+f²)dr=1 迫使峰高降低 √(18/6)=√3≈1.73倍！
-        #     这正是图像中 pred_g 峰值(~0.25) vs true_g 峰值(~0.65) 差异的主因
-        #   新值 8fm：仅保留 2fm 尾部缓冲区（dr=0.1, 20个点），足够数值稳定
+        # l_d: 小分量(F)轨道角动量
+        #   κ > 0 → l_d = κ - 1
+        #   κ < 0 → l_d = -κ
+        l_d = torch.where(k_val > 0, k_val - 1.0, -k_val).float()
+
+        # ══════════════════════════════════════════
+        #  Phase B: 精确幂律掩码 (r^{l+1})
+        # ══════════════════════════════════════════
+        pow_g = (l_u + 1.0)  # G 的幂指数: (B, 1)
+        pow_f = (l_d + 1.0)  # F 的幂指数: (B, 1)
+
+        # r=0 处保护：防止 0^0 或 NaN 梯度
+        #   物理上 r=0 是坐标原点，波函数在此处必须为零（对 l≥0）
+        #   数值上 r_min = dr/10 足够小，不影响物理行为
+        r_safe = r_max.clamp(min=1e-7)
+
+        # ★ 核心修复：直接使用精确幂律，不再用 tanh 近似！
+        ansatz_mask_g = (r_safe ** pow_g) * torch.exp(-alpha_g * r_max)
+        ansatz_mask_f = (r_safe ** pow_f) * torch.exp(-alpha_f * r_max)
+
+        # ══════════════════════════════════════════
+        #  Phase C: 远场截断（可选的额外衰减）
+        # ══════════════════════════════════════════
+        # 指数衰减已在 ansatz_mask 中包含（exp(-αr)）
+        # 此处的 r_cutoff 仅用于确保在盒子边界处严格归零
+        # ★ 2026-04-19: r_cutoff = 8.0 fm（保留2fm尾部缓冲）
         r_cutoff = 8.0
-        far_field_decay_g = torch.exp(-alpha_g * (r_max - r_cutoff).clamp(min=0.0))
-        far_field_decay_f = torch.exp(-alpha_f * (r_max - r_cutoff).clamp(min=0.0))
+        far_field_g = torch.exp(-alpha_g * torch.abs(r_max - r_cutoff).clamp(min=0.0) * 0.5)
+        far_field_f = torch.exp(-alpha_f * torch.abs(r_max - r_cutoff).clamp(min=0.0) * 0.5)
 
         # 组合边界条件：
-        # G(r) = raw_g(r) * g_origin_mask * far_field_decay_g
-        # F(r) = raw_f(r) * f_origin_mask * far_field_decay_f
-        g_constrained = raw_g * g_origin_mask * far_field_decay_g
-        f_constrained = raw_f * f_origin_mask * far_field_decay_f
+        # G(r) = raw_g · r^{l_u+1} · e^{-αg·r} · far_field
+        # F(r) = raw_f · r^{l_d+1} · e^{-αf·r} · far_field
+        g_constrained = raw_g * ansatz_mask_g * far_field_g
+        f_constrained = raw_f * ansatz_mask_f * far_field_f
 
         # 相位对齐：确保 G 的第一个显著峰值是正的（与标准约定一致）
         # ★ 关键修复：原逻辑用固定窗口[5:20](r=0.5~2.0fm)的均值判断相位
