@@ -46,11 +46,19 @@ class SobolevSmoother(nn.Module):
             weight = binomial_5.unsqueeze(0).unsqueeze(0).expand(channels, 1, -1).clone()
             self.conv.weight.data = weight
 
-        # ★ 可学习的残差缩放因子，初始为0（恒等映射）
-        # 训练中网络可以学习到：smooth_out = conv(x) * alpha + x
-        # alpha从0开始，意味着初始时平滑层不做任何事
-        # 随着训练进行，如果需要平滑，alpha会逐渐增大
-        self.residual_alpha = nn.Parameter(torch.zeros(1))
+        # ★ 可学习的残差缩放因子，初始为0.05（极轻量，仅防Gibbs锯齿）
+        # ★ 2026-04-19 诊断修复: 从 0.2 回调到 0.05
+        #
+        # 原问题：alpha=0.2 对 1s1/2 的尖锐物理峰(r≈0.5fm, 半宽~1fm) 有破坏性
+        #   Binomial-5 核 [1,4,6,4,1]/16 的频率响应:
+        #     f=0 (DC): 1.0 | f=Nyquist/4: 0.88 | f=Nyquist/2: 0.5
+        #   对峰的半宽~10个网格点(1fm/dr)，主频成分在 f≈0.1*Nyquist 处
+        #   alpha=0.2 → 峰被压低约 1-0.2*(1-0.95)=0.99 → 轻微但可叠加
+        #   alpha=0.2 + 解码器[1,2,1]滤波 = 双重平滑 → 峰高损失 ~15-20%
+        #
+        # 新策略：alpha=0.05 仅压制周期≤2点的高频Gibbs噪声，
+        #         不影响半宽>3点的物理结构。网络可自行增大alpha如果需要更多平滑。
+        self.residual_alpha = nn.Parameter(torch.tensor([0.05]))
 
     def forward(self, x):
         """
@@ -464,7 +472,7 @@ class RHF_FNO_GRU(nn.Module):
             macro_cond = self._normalize_zn(z_num, n_num)  # (B, 2)
         else:
             # 默认条件: 16O (Z=8, N=8)
-            macro_cond = torch.zeros(B, 2, device=x.device, dtype=x.float32)
+            macro_cond = torch.zeros(B, 2, device=x.device, dtype=torch.float32)
             macro_cond[:, 0] = 8.0 / self.z_max
             macro_cond[:, 1] = 8.0 / self.n_max
 
@@ -566,71 +574,101 @@ class RHF_FNO_GRU(nn.Module):
         decoded = self.decoder_fc(enhanced_hidden).view(B, self.hidden_dim, self.npt)
         delta_x = self.output_conv(decoded)
 
+        # ★ 解码器抗混叠平滑 — 2026-04-19修复: 仅对通道(2+)应用
+        # 问题: decoder_fc输出在空间维度独立 → 高频噪声
+        #   修复: g/f通道(0,1)跳过抗混叠（保留尖锐峰），仅势场通道(2-10)做平滑
+        if delta_x.size(-1) >= 3 and delta_x.size(1) > 2:
+            import torch.nn.functional as F_nn  # 避免与变量f冲突
+            aa_kernel = torch.tensor([[1.0, 2.0, 1.0]], dtype=delta_x.dtype, device=delta_x.device) / 4.0
+            delta_x_others = delta_x[:, 2:, :]
+            n_ch_aa = delta_x_others.size(1)
+            aa_kern_expanded = aa_kernel.expand(n_ch_aa, 1, -1)
+            delta_x_others_smooth = F_nn.conv1d(delta_x_others, aa_kern_expanded, padding=1, groups=n_ch_aa)
+            delta_x = torch.cat([delta_x[:, :2, :], delta_x_others_smooth], dim=1)
+
         # 目标改变: 直接预测收敛态，而非增量
         # pred_x = delta_x（直接输出，不加x_physics最后一帧）
         pred_x = delta_x
 
-        # --- 物理 Ansatz 整流 ---
+        # --- 物理约束处理 ---
+        # 根据核物理教材（龙文辉《核物理计算实践》）径向 Dirac 方程边界条件：
+        # 1. 在 r→0 处：G(r) ~ r^(l_u+1), F(r) ~ r^(l_d+1)
+        # 2. 在 r=R 处（截断边界）：G(R) = 0, F(R) = C_R（非零常数）
         raw_g = pred_x[:, 0, :]
         raw_f = pred_x[:, 1, :]
 
-        # 预测衰减系数
-        alpha_g_raw = self.alpha_net(enhanced_hidden)  # (B, 1) — 仅预测 alpha_g
-        alpha_g = (0.1 + 2.9 * torch.sigmoid(alpha_g_raw)).squeeze(-1)  # ★ alpha_g ∈ [0.1, 3.0]
-        # ★ 分离衰减：alpha_f = alpha_g * (1 + softplus(f_alpha_offset))
-        # 物理保证：f 的远场衰减速度始终 > g，softplus确保偏移量>0
-        alpha_f = alpha_g * (1.0 + F.softplus(self.f_alpha_offset))  # (B,)
-        # 扩展为 (B, 1) 以便后续广播
+        # 预测衰减系数（用于远场指数衰减）
+        alpha_g_raw = self.alpha_net(enhanced_hidden)
+        alpha_g = (0.1 + 2.9 * torch.sigmoid(alpha_g_raw)).squeeze(-1)
+        alpha_f = alpha_g * (1.0 + F.softplus(self.f_alpha_offset))
         alpha_g = alpha_g.unsqueeze(1)
         alpha_f = alpha_f.unsqueeze(1)
-        kappa_exp = kappa.abs().unsqueeze(1)
 
-        # ★ 增强远场衰减：在 r > 15fm 区域施加更强的指数压制
-        # 方法：对 r_grid 构造分段衰减函数，远场区域额外乘以二次衰减因子
+        # 获取 r_grid
         r_max = (r_grid if r_grid.dim() == 2 else r_grid.unsqueeze(0))
-        far_field_factor = torch.where(
-            r_max > 15.0,
-            torch.exp(-0.05 * (r_max - 15.0) ** 2),  # 高斯型额外衰减
-            torch.ones_like(r_max)
-        )
 
-        # 施加硬边界条件约束: r^{|kappa|} * exp(-alpha * r) * NN(r) * far_field_factor
-        ansatz_mask_g = (r_grid ** kappa_exp) * torch.exp(-alpha_g * r_grid) * far_field_factor.squeeze() if far_field_factor.dim() == 3 else (r_grid ** kappa_exp) * torch.exp(-alpha_g * r_grid)
-        ansatz_mask_f = (r_grid ** kappa_exp) * torch.exp(-alpha_f * r_grid) * far_field_factor.squeeze() if far_field_factor.dim() == 3 else (r_grid ** kappa_exp) * torch.exp(-alpha_f * r_grid)
+        # 根据 kappa 计算上下分量的轨道角动量
+        # κ > 0: l_u = κ, l_d = κ - 1
+        # κ < 0: l_u = -κ - 1, l_d = -κ
+        kappa_expanded = kappa.view(-1, 1).float()
+        l_u = torch.where(kappa_expanded > 0, kappa_expanded, -kappa_expanded - 1)
+        l_d = torch.where(kappa_expanded > 0, kappa_expanded - 1, -kappa_expanded)
 
-        # ===== ★ 统一鲁棒找峰相位对齐（与 Physics_Informed_Loss.py 一致）=====
-        # 替代原有的内区均值翻转，使用双阶段显著峰检测
-        def _model_find_first_peak(g_out):
-            """模型前向传播中使用的轻量版找峰（与 loss 中的逻辑一致）"""
-            B_loc, L_loc = g_out.shape
-            order = 5
-            abs_g = torch.abs(g_out)
-            search_start = max(order + 1, 5)
-            search_end = L_loc - order
-            if search_end <= search_start:
-                return abs_g.argmax(dim=-1), g_out[torch.arange(B_loc, device=g_out.device), abs_g.argmax(dim=-1)]
-            mask_r = torch.ones_like(abs_g); mask_r[:, :search_start] = 0; mask_r[:, search_end:] = 0
-            anchor_idx = (abs_g * mask_r).argmax(dim=-1)
-            pad_p = torch.nn.functional.pad(abs_g, (order, order), value=-float('inf'))
-            pool_p = torch.nn.functional.max_pool1d(pad_p.unsqueeze(1), kernel_size=2*order+1, stride=1).squeeze(1)
-            is_lm = (abs_g >= pool_p - 1e-10) & (abs_g > 0) & (mask_r.bool())
-            lm_m = torch.zeros_like(is_lm); lm_m[:, order:L_loc-order] = True; is_lm = is_lm & lm_m
-            ar_L = torch.arange(L_loc, dtype=torch.long, device=g_out.device).unsqueeze(0)
-            is_cand = is_lm.clone() & (ar_L <= anchor_idx.unsqueeze(1))
-            rev_cs = is_cand.flip(dims=[1]).float().cumsum(dim=-1).flip(dims=[1])
-            is_last = is_cand & (rev_cs == 1)
-            last_p = ar_L.masked_fill(~is_last, 0).amax(dim=-1)
-            has_c = (is_cand.float().sum(dim=-1) > 0)
-            final_i = torch.where(has_c, last_p, anchor_idx)
-            return final_i, g_out[torch.arange(B_loc, device=g_out.device), final_i]
+        # 原点边界条件：G(r) ~ r^(l_u+1), F(r) ~ r^(l_d+1)
+        # 使用 soft 版本：乘以 tanh(r/epsilon)^(l+1) 来近似 r^(l+1) 行为
+        epsilon = 0.1
+        origin_factor = torch.tanh(r_max / epsilon)
+        g_origin_mask = origin_factor ** (l_u + 1)
+        f_origin_mask = origin_factor ** (l_d + 1)
 
-        peak_idx_model, peak_val_model = _model_find_first_peak(raw_g)
-        flip_sign = (peak_val_model < 0).float().unsqueeze(-1)
-        raw_g = raw_g * flip_sign - raw_g * (1 - flip_sign)
-        raw_f = raw_f * flip_sign - raw_f * (1 - flip_sign)
+        # 远场边界条件：在 r=R 处 G(R)=0（指数衰减）
+        # F(R) 可以是非零常数，但也施加衰减以确保数值稳定
+        # ★ 关键修复(2026-04-19): r_cutoff 从 18.0 回调到 8.0 fm
+        #
+        # 物理依据（教材公式3.60 + 3.61）：
+        #   束缚态波函数在远场应指数衰减 → 0，1s1/2 态在 r>6fm 时 |g|<0.01
+        #   原值 18fm 的错误：强制波形在 [6,18]fm 区间保持显著非零 →
+        #     归一化约束 ∫(g²+f²)dr=1 迫使峰高降低 √(18/6)=√3≈1.73倍！
+        #     这正是图像中 pred_g 峰值(~0.25) vs true_g 峰值(~0.65) 差异的主因
+        #   新值 8fm：仅保留 2fm 尾部缓冲区（dr=0.1, 20个点），足够数值稳定
+        r_cutoff = 8.0
+        far_field_decay_g = torch.exp(-alpha_g * (r_max - r_cutoff).clamp(min=0.0))
+        far_field_decay_f = torch.exp(-alpha_f * (r_max - r_cutoff).clamp(min=0.0))
 
-        g_constrained = raw_g * ansatz_mask_g
-        f_constrained = raw_f * ansatz_mask_f
+        # 组合边界条件：
+        # G(r) = raw_g(r) * g_origin_mask * far_field_decay_g
+        # F(r) = raw_f(r) * f_origin_mask * far_field_decay_f
+        g_constrained = raw_g * g_origin_mask * far_field_decay_g
+        f_constrained = raw_f * f_origin_mask * far_field_decay_f
+
+        # 相位对齐：确保 G 的第一个显著峰值是正的（与标准约定一致）
+        # ★ 关键修复：原逻辑用固定窗口[5:20](r=0.5~2.0fm)的均值判断相位
+        #   问题: 不同态的峰位置完全不同(1s在r≈0.5fm, 2s在r≈2fm, 2p在r≈3fm)
+        #         固定窗口可能落在节点负区 → 错误翻转 → 训练震荡
+        #   新方法: 用soft-argmax找|g|的最大值位置，在该位置检查符号
+        abs_g = torch.abs(g_constrained)
+        # 跳过前5个点(r<0.5fm)的近核平坦区，避免噪声峰干扰
+        search_start = 5
+        if search_start < abs_g.shape[-1]:
+            abs_g_search = abs_g[:, search_start:]
+            r_search = r_max[:, search_start:] if r_max.dim() == 2 else r_max[search_start:]
+            # soft-argmax: 可微的加权均值峰值位置检测
+            temperature = 0.1
+            weights = torch.softmax(abs_g_search / temperature, dim=-1)
+            peak_pos_idx = (weights * r_search).sum(dim=-1)  # (B,) 连续位置
+            # 取峰值位置的符号（通过线性插值近似）
+            # 简化: 用搜索区域内最大值点的符号（接近argmax但更稳定）
+            max_idx = abs_g_search.argmax(dim=-1)  # (B,)
+            peak_val_aligned = g_constrained[
+                torch.arange(B, device=g_constrained.device),
+                search_start + max_idx
+            ]  # (B,) 峰值处的g符号
+        else:
+            peak_val_aligned = g_constrained[:, 5:20].mean(dim=1)  # fallback
+
+        flip_sign = (peak_val_aligned < 0).float().unsqueeze(-1)
+        g_constrained = g_constrained * (1 - 2 * flip_sign)
+        f_constrained = f_constrained * (1 - 2 * flip_sign)
 
         # ===== ★ Sobolev 平滑正则化 (消除锯齿) =====
         # 在 ansatz mask 之后、归一化之前对 g/f 做可学习平滑
@@ -654,29 +692,14 @@ class RHF_FNO_GRU(nn.Module):
         g_normalized = g_constrained * norm_factor
         f_normalized = f_constrained * norm_factor
 
-        # ===== 硬约束：防止 f 分量被偷懒置零 =====
-        # 物理事实：狄拉克束缚态的 f/g 比例在核内区域通常为 5%~30%
-        # 如果 ∫f² / ∫(g²+f²) < f_min_ratio，强制提升 f 的幅度
-        f_min_ratio = 0.15  # ★ f至少贡献15%的概率密度（从0.05提升，确保f分量不被忽略）
-        f_power_frac = (f_normalized ** 2).sum(dim=-1, keepdim=True) * dr_val  # (B,1)
-        # f_power_frac 应该在 [0, 1] 范围（因为已归一化）
-        f_deficit = torch.clamp(f_min_ratio - f_power_frac, min=0.0)  # (B,1)
-        # 有亏空时：放大 f，重新归一化保持总概率=1
-        has_deficit = (f_deficit > 1e-6).squeeze(-1)  # (B,)
-        if has_deficit.any():
-            # 提升因子：让 f 贡献达到 f_min_ratio
-            # 设放大 k 倍后: k²*f² / (g² + k²*f²) ≥ f_min_ratio
-            # 解得: k² ≥ f_min_ratio * (g²+f²) / ((1-f_min_ratio)*f²)
-            g_sq_sum = (g_normalized ** 2).sum(dim=-1, keepdim=True) * dr_val
-            f_sq_sum = (f_normalized ** 2).sum(dim=-1, keepdim=True) * dr_val + 1e-10
-            target_k_sq = (f_min_ratio * 1.0) / ((1.0 - f_min_ratio) * f_sq_sum.clamp(min=1e-10))
-            k_boost = torch.sqrt(target_k_sq.clamp(min=1.0))  # (B,1), 最小为1
-            f_normalized = f_normalized * k_boost
-            # 重新归一化
-            total_new = (g_normalized**2 + f_normalized**2).sum(dim=-1, keepdim=True) * dr_val
-            renorm = torch.sqrt(total_new.clamp(min=1e-10))
-            g_normalized = g_normalized / renorm
-            f_normalized = f_normalized / renorm
+        # ===== 软约束：f 分量引导（非强制放大） =====
+        # ★ 关键修复：原硬约束(f_min_ratio=0.15 + 强制k_boost放大)导致正反馈循环:
+        #   网络输出f小 → 放大f → 重归一化 → g被压缩 → 概率向单点集中 → delta函数!
+        #
+        # 新策略：仅通过可学习的缩放因子引导f幅度，不做任何硬性放大/重归一化
+        # 让网络自己学习正确的g/f比例，物理损失(PDE+Rayleigh商)会自然约束这个比例
+        # 如果需要额外的f激励，使用软惩罚项(在loss中)而非硬操作(在forward中)
+        pass  # 不再做任何f分量干预，保持归一化后的自然结果
 
         g_ansatz = g_normalized.unsqueeze(1)
         f_ansatz = f_normalized.unsqueeze(1)

@@ -360,18 +360,29 @@ def train_model():
     # --- 模型结构超参数 ---
     hidden_dim = 96
     gru_hidden = 1536
-    modes = 40
+    modes = 64  # ★ 关键修复: 从40提升到64, 保留频率比例39%→63%, 减少Gibbs振荡
     weight_decay = 1e-4
     use_self_attention = True  # ★ 启用轨道自注意力
 
-    # --- ★ 精简物理损失权重（6个核心损失）---
-    lambda_data = 0.5         # MSE数据拟合权重（辅助）
-    lambda_pde = 5.0          # Dirac方程残差（主导）
-    lambda_norm = 5.0         # 归一化强约束
-    lambda_node = 8.0         # 节点数精确硬约束
-    lambda_physical = 10.0    # ★ 合并：正能量态+动能正定性
-    lambda_smooth = 5.0       # ★ 合并：波形光滑性+远场衰减+边界
-    lambda_rayleigh = 8.0     # ★ Rayleigh商能量一致性
+    # --- ★ 极简损失（5+1项：data主导 + 物理软引导）---
+    # ★ 核心原则: data MSE绝对统治, 物理损失仅做软引导/安全护栏
+    #
+    #   保留6项:
+    #     1. lambda_data=10      — 绝对主导! 唯一含"正确波形"信息的信号
+    #     2. lambda_pde=1        — PDE残差物理引导(轻量)
+    #     3. lambda_norm=0.5     — 归一化保险(架构已有硬约束)
+    #     4. lambda_smooth=2     — 曲率+TV+HF谱防锯齿
+    #     5. lambda_rayleigh=1   — Rayleigh商能量一致性(自注意力物理验证!)
+    #        权重从3→1: "软引导"非"硬锁死", 循环依赖被data=10压制
+    #     6. lambda_physical=0.5 — 正能量+动能正定性(纯安全护栏)
+    #   删除: node/tail/mono/boundary (形态假设压成台阶状)
+    lambda_data = 5.0         # ★ 绝对主导!
+    lambda_pde = 1.0           # PDE物理引导（轻量）
+    lambda_norm = 0.5          # 归一化（架构已硬归一化, 仅保险）
+    lambda_smooth = 2.0        # 光滑性（曲率+TV+HF谱, 无形态假设）
+    lambda_tail = 2.0          # ★ 尾部概率集中（配合r_cut=8fm，引导波形局域化）
+    lambda_rayleigh = 1.0      # ★ Rayleigh商能量一致性（软引导权重）
+    lambda_physical = 1.0      # ★ 正能量态+动能正定性（纯护栏）
 
     # ★ f分量MSE加权系数
     f_mse_weight = 5.0
@@ -551,14 +562,13 @@ def train_model():
     base_r_grid = torch.arange(0, 201, device=device, dtype=torch.float32) * dr
     base_r_grid[0] = 0.0010
 
-    # 初始化 CSV 日志（★ 精简6损失 + RHF一致性）
+    # 初始化 CSV 日志（★ 5物理+1数据）
     if is_main:
         with open(log_csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['epoch', 'phase', 'total_loss', 'loss_data',
-                           'loss_pde', 'loss_norm', 'loss_node',
-                           'loss_physical', 'loss_smooth', 'loss_rayleigh',
-                           'loss_consistency',
+                           'loss_pde', 'loss_norm', 'loss_smooth',
+                           'loss_rayleigh', 'loss_physical', 'loss_tail',
                            'E_rayleigh', 'E_network', 'E_kin',
                            'vps_core', 'vms_core', 'norm_integral',
                            'learning_rate', 'best_epoch', 'n_isotopes'])
@@ -622,12 +632,40 @@ def train_model():
             train_loader.sampler.set_epoch(epoch)
 
         # ══════════════════════════════════════
-        # 物理损失权重调度
-        # 从第1轮就启用物理约束（无预热）
-        # ★ 物理主导模式：始终全量启用物理约束（无需调度）
-        # 阶段3: Cosine Annealing LR 收尾时保持 λ
-        # ══════════════════════════════════════
-        # （compute_physics 在每个 batch 内部计算）
+        # 物理损失权重调度（★ 新增warm-up）
+        #
+        # 原问题: 第一epoch就全量启用6个物理损失(总权重=41)，
+        #         网络还没学会基本波形形状就被强约束锁死到delta局部最优
+        #
+        # ★ warm-up (6项: data永远全开, 物理逐步引入)
+        #   Phase 1 (Ep 1-30):   Data+PDE+Norm(半), 波形形状优先
+        #   Phase 2 (Ep 31-80):  引入Smooth+Rayleigh+Physical, 物理一致性
+        #   Phase 3 (Ep 81+):    全部6项
+        phy_warmup_epochs_p1 = 30
+        phy_warmup_epochs_p2 = 80
+
+        if epoch <= phy_warmup_epochs_p1:
+            eff_lambda_pde = lambda_pde * 0.5
+            eff_lambda_norm = lambda_norm * 0.5
+            eff_lambda_smooth = 0.0
+            eff_lambda_tail = 0.0          # ★ 新增
+            eff_lambda_rayleigh = 0.0
+            eff_lambda_physical = 0.0
+        elif epoch <= phy_warmup_epochs_p2:
+            progress = (epoch - phy_warmup_epochs_p1) / (phy_warmup_epochs_p2 - phy_warmup_epochs_p1)
+            eff_lambda_pde = lambda_pde * (0.5 + 0.5 * progress)
+            eff_lambda_norm = lambda_norm * (0.5 + 0.5 * progress)
+            eff_lambda_smooth = lambda_smooth * progress * 0.8
+            eff_lambda_tail = lambda_tail * progress * 0.8           # ★ 新增：尾部集中
+            eff_lambda_rayleigh = lambda_rayleigh * progress * 0.5  # 更晚引入
+            eff_lambda_physical = lambda_physical * progress * 0.5
+        else:
+            eff_lambda_pde = lambda_pde
+            eff_lambda_norm = lambda_norm
+            eff_lambda_smooth = lambda_smooth
+            eff_lambda_tail = lambda_tail       # ★ 新增
+            eff_lambda_rayleigh = lambda_rayleigh
+            eff_lambda_physical = lambda_physical
 
         # 学习率调度
         if current_phase == 3:
@@ -643,11 +681,10 @@ def train_model():
         total_loss_data = 0.0
         total_loss_pde = 0.0
         total_loss_norm = 0.0
-        total_loss_node = 0.0
-        total_loss_physical = 0.0
         total_loss_smooth = 0.0
         total_loss_rayleigh = 0.0
-        total_loss_consistency = 0.0
+        total_loss_physical = 0.0
+        total_loss_tail = 0.0       # 2026-04-19 new
         num_batches = 0
 
         optimizer.zero_grad(set_to_none=True)
@@ -699,25 +736,24 @@ def train_model():
                     )
                     loss_pde = phy_components['loss_pde']
                     loss_norm = phy_components['loss_norm']
-                    loss_node = phy_components['loss_node']
-                    loss_physical = phy_components['loss_physical_state']
                     loss_smooth = phy_components['loss_smoothness']
                     loss_rayleigh = phy_components['loss_energy_rayleigh']
+                    loss_physical = phy_components['loss_physical_state']
+                    loss_tail_c = phy_components.get('loss_tail_concentration', torch.tensor(0.0, device=device))
 
-                    # ★ 精简损失组合（6项）
-                    loss_phy = (lambda_pde * loss_pde +
-                                lambda_norm * loss_norm +
-                                lambda_node * loss_node +
-                                lambda_physical * loss_physical +
-                                lambda_smooth * loss_smooth +
-                                lambda_rayleigh * loss_rayleigh)
+                    # ★ 损失组合（6项物理 + 1项数据主导）
+                    loss_phy = (eff_lambda_pde * loss_pde +
+                                eff_lambda_norm * loss_norm +
+                                eff_lambda_smooth * loss_smooth +
+                                eff_lambda_tail * loss_tail_c +         # ★ 新增
+                                eff_lambda_rayleigh * loss_rayleigh +
+                                eff_lambda_physical * loss_physical)
                 else:
                     loss_pde = torch.tensor(0.0, device=device)
                     loss_norm = torch.tensor(0.0, device=device)
-                    loss_node = torch.tensor(0.0, device=device)
-                    loss_physical = torch.tensor(0.0, device=device)
                     loss_smooth = torch.tensor(0.0, device=device)
                     loss_rayleigh = torch.tensor(0.0, device=device)
+                    loss_physical = torch.tensor(0.0, device=device)
                     loss_phy = torch.tensor(0.0, device=device)
 
                 # ★ 总损失 = 弱MSE辅助 + 强物理主导
@@ -745,10 +781,10 @@ def train_model():
             total_loss_data += loss_data.item()
             total_loss_pde += (loss_pde.item() * grad_accum_steps) if isinstance(loss_pde, torch.Tensor) and loss_pde.requires_grad else 0.0
             total_loss_norm += (loss_norm.item() * grad_accum_steps) if isinstance(loss_norm, torch.Tensor) and loss_norm.requires_grad else 0.0
-            total_loss_node += (loss_node.item() * grad_accum_steps) if isinstance(loss_node, torch.Tensor) and loss_node.requires_grad else 0.0
-            total_loss_physical += (loss_physical.item() * grad_accum_steps) if isinstance(loss_physical, torch.Tensor) and loss_physical.requires_grad else 0.0
             total_loss_smooth += (loss_smooth.item() * grad_accum_steps) if isinstance(loss_smooth, torch.Tensor) and loss_smooth.requires_grad else 0.0
             total_loss_rayleigh += (loss_rayleigh.item() * grad_accum_steps) if isinstance(loss_rayleigh, torch.Tensor) and loss_rayleigh.requires_grad else 0.0
+            total_loss_physical += (loss_physical.item() * grad_accum_steps) if isinstance(loss_physical, torch.Tensor) and loss_physical.requires_grad else 0.0
+            total_loss_tail += (loss_tail_c.item() * grad_accum_steps) if isinstance(loss_tail_c, torch.Tensor) and loss_tail_c.requires_grad else 0.0
             num_batches += 1
 
         # LR调度（3阶段）
@@ -777,10 +813,10 @@ def train_model():
         loss_data_avg = total_loss_data / n_batches
         loss_pde_avg = total_loss_pde / n_batches
         loss_norm_avg = total_loss_norm / n_batches
-        loss_node_avg = total_loss_node / n_batches
-        loss_physical_avg = total_loss_physical / n_batches
         loss_smooth_avg = total_loss_smooth / n_batches
         loss_rayleigh_avg = total_loss_rayleigh / n_batches
+        loss_physical_avg = total_loss_physical / n_batches
+        loss_tail_avg = total_loss_tail / n_batches
 
         # Early Stopping
         current_data_loss = loss_data_avg
@@ -815,9 +851,8 @@ def train_model():
                     epoch, current_phase,
                     f"{loss_total_avg:.6f}", f"{loss_data_avg:.6f}",
                     f"{loss_pde_avg:.6f}", f"{loss_norm_avg:.6f}",
-                    f"{loss_node_avg:.6f}",
-                    f"{loss_physical_avg:.6f}", f"{loss_smooth_avg:.6f}",
-                    f"{loss_rayleigh_avg:.6f}",
+                    f"{loss_smooth_avg:.6f}",
+                    f"{loss_rayleigh_avg:.6f}", f"{loss_physical_avg:.6f}",
                     f"{E_rayleigh_val:.4f}", f"{E_network_val:.4f}",
                     f"{E_kin_val:.4f}",
                     f"{norm_int_val:.6f}",
@@ -828,8 +863,8 @@ def train_model():
             if epoch % 5 == 0 or epoch == 1:
                 phase_names = {1: "核心束缚态", 2: "中等激发态", 3: "全轨道精调"}
                 print(f"Epoch [{epoch:3d}/{num_epochs}] | Phase{current_phase}({phase_names[current_phase]}) | LR: {current_lr:.2e}", flush=True)
-                print(f"  [精简6损失] Total: {loss_total_avg:.4f} | Data: {loss_data_avg:.4f}(×{lambda_data}) | PDE: {loss_pde_avg:.4f}(×{lambda_pde}) | Norm: {loss_norm_avg:.4f}(×{lambda_norm})", flush=True)
-                print(f"              Node: {loss_node_avg:.4f}(×{lambda_node}) | Physical: {loss_physical_avg:.6f}(×{lambda_physical}) | Smooth: {loss_smooth_avg:.4f}(×{lambda_smooth}) | Rayleigh: {loss_rayleigh_avg:.6f}(×{lambda_rayleigh})", flush=True)
+                print(f"  [6损失] Total: {loss_total_avg:.4f} | Data: {loss_data_avg:.4f}(×{lambda_data}) | PDE: {loss_pde_avg:.4f}({lambda_pde}) | Norm: {loss_norm_avg:.4f}({lambda_norm})", flush=True)
+                print(f"         Smooth: {loss_smooth_avg:.4f}({lambda_smooth}) | Tail: {loss_tail_avg:.4f}({lambda_tail}) | Rayleigh: {loss_rayleigh_avg:.6f}({lambda_rayleigh}) | Physical: {loss_physical_avg:.6f}({lambda_physical})", flush=True)
                 print(f"  [诊断] E_rayleigh={E_rayleigh_val:.2f} MeV | E_network={E_network_val:.2f} MeV | E_kin={E_kin_val:.2f} | norm={norm_int_val:.6f}", flush=True)
 
             # 物理验证

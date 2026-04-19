@@ -209,7 +209,7 @@ class _RHF_MetaDataset:
                 pot_path = os.path.join(pot_dir, pot_file)
                 if not os.path.exists(pot_path):
                     continue
-                res = _parse_single_step(wav_path, pot_path)
+                res = _parse_single_step(wav_path, pot_path, data_dir)
                 if res is not None:
                     valid_steps.append(res[0])
                     kappa = res[1]
@@ -364,7 +364,8 @@ class _RHF_Dataset(Dataset):
             for wav_file in state_files:
                 pot_file = wav_file.replace('.it', '_POT.it')
                 res = _parse_single_step(os.path.join(wav_dir, wav_file),
-                                         os.path.join(pot_dir, pot_file))
+                                         os.path.join(pot_dir, pot_file),
+                                         data_dir)
                 if res is not None:
                     step_tensor, parsed_kappa, parsed_proton = res
                     trajectory_data.append(step_tensor)
@@ -531,14 +532,121 @@ def _check_converged(filepath):
     return _check_extreme(filepath)
 
 
-def _parse_single_step(wav_path, pot_path):
+# ═══════════════════════════════════════════════════════════════════════════
+# PKA1 文件缓存：避免重复读取
+# ═══════════════════════════════════════════════════════════════════════════
+_pka1_cache = {}  # {(isotope, particle_type): (r_grid, state_names, G_data, F_data)}
+
+
+def _load_pka1_data(data_dir, isotope, particle_type):
+    """
+    从 PKA1 文件加载最终收敛的波函数 G/F 分量。
+
+    PKA1 文件格式：
+      - 行0: 占据概率（43列：1列标识 + 42列态）
+      - 行1: 列标题 r, N.1s.1/2, N.2s.1/2, ...
+      - 行2+: 数据行（201个径向点，dr=0.1fm）
+
+    参数:
+      data_dir: 数据根目录
+      isotope: 核素名（如 '16O'）
+      particle_type: 'N'（中子）或 'P'（质子）
+
+    返回:
+      (r_grid, state_names, G_data, F_data) 或 None
+      - r_grid: (201,) 径向网格
+      - state_names: 状态名列表（如 ['N.1s.1/2', 'N.2s.1/2', ...]）
+      - G_data: (n_states, 201) 大分量
+      - F_data: (n_states, 201) 小分量
+    """
+    cache_key = (isotope, particle_type)
+    if cache_key in _pka1_cache:
+        return _pka1_cache[cache_key]
+
+    # 构建 PKA1 文件路径
+    prefix_map = {
+        '14O': 'O14', '16O': 'O16', '18O': 'O18', '20O': 'O20',
+        '22O': 'O22', '24O': 'O24',
+        '36Ca': 'Ca36', '38Ca': 'Ca38', '40Ca': 'Ca40',
+        '42Ca': 'Ca42', '44Ca': 'Ca44', '46Ca': 'Ca46', '48Ca': 'Ca48',
+        '50Ca': 'Ca50', '52Ca': 'Ca52',
+        '56Ni': 'Ni56', '58Ni': 'Ni58', '60Ni': 'Ni60', '62Ni': 'Ni62',
+        '64Ni': 'Ni64', '68Ni': 'Ni68', '72Ni': 'Ni72', '78Ni': 'Ni78',
+        '100Sn': 'Sn100', '112Sn': 'Sn112', '116Sn': 'Sn116',
+        '120Sn': 'Sn120', '124Sn': 'Sn124', '132Sn': 'Sn132',
+        '204Pb': 'Pb204', '206Pb': 'Pb206', '208Pb': 'Pb208', '210Pb': 'Pb210',
+        '86Kr': 'Kr86', '88Sr': 'Sr88', '90Zr': 'Zr90', '92Mo': 'Mo92',
+    }
+    prefix = prefix_map.get(isotope, isotope)
+    pka1_g_path = os.path.join(data_dir, isotope, 'WAV', f'{prefix}.G-{particle_type}.PKA1')
+    pka1_f_path = os.path.join(data_dir, isotope, 'WAV', f'{prefix}.F-{particle_type}.PKA1')
+
+    if not os.path.exists(pka1_g_path) or not os.path.exists(pka1_f_path):
+        return None
+
+    try:
+        # 读取 G 文件（大分量）
+        with open(pka1_g_path, 'r') as f:
+            lines_g = f.readlines()
+
+        # 解析列标题获取状态名
+        header = lines_g[1].strip().split()
+        state_names = header[1:]  # 跳过 'r'
+
+        # 读取数据（跳过前2行）
+        data_g = np.loadtxt(pka1_g_path, comments='#', skiprows=2)
+        data_f = np.loadtxt(pka1_f_path, comments='#', skiprows=2)
+
+        r_grid = data_g[:, 0]
+        G_data = data_g[:, 1:].T  # (n_states, n_points)
+        F_data = data_f[:, 1:].T  # (n_states, n_points)
+
+        result = (r_grid, state_names, G_data, F_data)
+        _pka1_cache[cache_key] = result
+        return result
+    except Exception as e:
+        print(f"  ⚠️ 读取 PKA1 文件失败: {e}")
+        return None
+
+
+def _get_state_index_from_loop(wav_path):
+    """
+    从 loop 文件名或内容中提取状态索引（用于 PKA1 文件列查找）。
+
+    返回: (state_name, n_principal) 如 ('N.1s.1/2', 1)
+    """
+    try:
+        with open(wav_path, 'r') as f:
+            content = f.read()
+
+        # 从 State: 行提取信息
+        match = re.search(r'State:\s*([NP])\.(\d+)([a-z])\.(\d+)/2', content)
+        if match:
+            particle = match.group(1)
+            n_val = int(match.group(2))
+            l_char = match.group(3)
+            j_half = int(match.group(4))
+            state_name = f"{particle}.{n_val}{l_char}.{j_half}/2"
+            return state_name, n_val
+    except Exception:
+        pass
+    return None, 1
+
+
+def _parse_single_step(wav_path, pot_path, data_dir=None):
     """
     核心解析函数：提取 11 个物理通道和 kappa 量子数。
+
+    ★ 关键修复：波函数从 PKA1 文件读取（最终收敛态），
+       而非 loop 文件（被截断的 RHF 迭代数据）。
 
     返回: (tensor_11x201, kappa_float, is_proton_float) 或 None
 
     11个通道: [g, f, vps, vms, vtt, XG, XF, YG, YF, E_array, vv_array]
     """
+    # ═══════════════════════════════════════════════════════════════════════
+    # 步骤1: 从 loop 文件读取元信息（能量、占据、态标识）
+    # ═══════════════════════════════════════════════════════════════════════
     with open(wav_path, 'r') as f:
         lines = f.readlines()
 
@@ -552,6 +660,7 @@ def _parse_single_step(wav_path, pot_path):
     match = re.search(r'State:\s*([NP])\.\d+([a-z])\.(\d+)/2', state_line)
     kappa = -1.0
     is_proton = 0.0
+    state_name_from_loop = None
     if match:
         particle = match.group(1)
         l_char = match.group(2)
@@ -561,13 +670,62 @@ def _parse_single_step(wav_path, pot_path):
         l_val = l_map.get(l_char, 0)
         j_val = j_num / 2.0
         kappa = -(l_val + 1) if j_val > l_val else l_val
+        state_name_from_loop = f"{particle}.{match.group(0).split('.')[1]}.{int(j_num)}/2"
 
-    wav_data = np.loadtxt(wav_path, comments='#', converters={1: _fix_fortran_float, 2: _fix_fortran_float})
-    g, f = wav_data[:, 1], wav_data[:, 2]
+    # ═══════════════════════════════════════════════════════════════════════
+    # 步骤2: 从 PKA1 文件读取正确的波函数 G/F 分量
+    # ═══════════════════════════════════════════════════════════════════════
+    # 推断 data_dir 从 wav_path
+    if data_dir is None:
+        # wav_path = .../results/16O/WAV/O16_state001.it001.loop001
+        data_dir = os.path.dirname(os.path.dirname(os.path.dirname(wav_path)))
+
+    # 从 loop 文件名推断核素
+    wav_dir = os.path.dirname(wav_path)
+    isotope = os.path.basename(os.path.dirname(wav_dir))
+
+    particle_type = 'P' if is_proton else 'N'
+
+    # 加载 PKA1 数据
+    pka1_result = _load_pka1_data(data_dir, isotope, particle_type)
+    if pka1_result is None:
+        # 回退到 loop 文件（如果 PKA1 不存在）
+        print(f"  ⚠️ PKA1 文件不存在，回退到 loop 文件: {isotope} {particle_type}")
+        wav_data = np.loadtxt(wav_path, comments='#', converters={1: _fix_fortran_float, 2: _fix_fortran_float})
+        g, f = wav_data[:, 1], wav_data[:, 2]
+    else:
+        r_grid_pka, state_names, G_data, F_data = pka1_result
+
+        # 从 loop 文件内容获取状态名
+        state_name_loop, n_principal = _get_state_index_from_loop(wav_path)
+
+        # 在 PKA1 状态列表中查找匹配
+        if state_name_loop and state_name_loop in state_names:
+            state_idx = state_names.index(state_name_loop)
+            g = G_data[state_idx].copy()
+            f = F_data[state_idx].copy()
+        else:
+            # 尝试模糊匹配（忽略大小写）
+            state_name_lower = state_name_loop.lower() if state_name_loop else None
+            found = False
+            for i, name in enumerate(state_names):
+                if name.lower() == state_name_lower:
+                    g = G_data[i].copy()
+                    f = F_data[i].copy()
+                    found = True
+                    break
+            if not found:
+                print(f"  ⚠️ 状态 {state_name_loop} 不在 PKA1 中，回退到 loop 文件")
+                wav_data = np.loadtxt(wav_path, comments='#', converters={1: _fix_fortran_float, 2: _fix_fortran_float})
+                g, f = wav_data[:, 1], wav_data[:, 2]
 
     npt = len(g)
     r_grid = np.arange(npt) * 0.10
     r_grid[0] = 0.0010
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # 步骤3: 归一化波函数
+    # ═══════════════════════════════════════════════════════════════════════
     norm_integral = np.trapz(g**2 + f**2, x=r_grid)
 
     if norm_integral > 1e-12:
@@ -576,32 +734,20 @@ def _parse_single_step(wav_path, pot_path):
     else:
         return None
 
-    # ★ 极端值检查移到归一化之后（RHF原始数据量级可达10^9，归一化后才O(1)）
+    # 极端值检查
     if np.max(np.abs(g)) > 50.0 or np.max(np.abs(f)) > 50.0:
         return None
 
-    # ★ 统一相位约定：第一个峰（|g|的局部极大值）为正
-    # 不同RHF计算的波函数可能有任意整体符号(ψ与-ψ满足同一方程),
-    # 相位混乱会导致网络无法学习一致规律。
-    # 策略：在全局范围内搜索|g|的第一个局部极大值，确保其为正。
-    if len(g) > 6:
-        order = 5
-        abs_g = np.abs(g)
-        ref_idx = None
-        for i in range(order, len(g) - order):
-            is_max = True
-            for j in range(1, order + 1):
-                if abs_g[i] <= abs_g[i - j] or abs_g[i] <= abs_g[i + j]:
-                    is_max = False
-                    break
-            if is_max:
-                ref_idx = i
-                break
-        if ref_idx is None:
-            ref_idx = int(np.argmax(abs_g))
-        if g[ref_idx] < 0:
-            g, f = -g, -f
+    # ═══════════════════════════════════════════════════════════════════════
+    # 步骤4: 相位约定 - 保持 PKA1 原始相位（不再强制翻转）
+    # ═══════════════════════════════════════════════════════════════════════
+    # ★ 重要：PKA1 文件中的波函数已经是物理正确的相位
+    # 对于 κ<0 的态（如 1s1/2），g>0, f<0 是正确的物理行为
+    # 不再强制翻转相位，让网络学习真实的物理相位关系
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # 步骤5: 从 POT 文件读取势场
+    # ═══════════════════════════════════════════════════════════════════════
     pot_data = np.loadtxt(pot_path, comments='#')
     vps, vms, vtt = pot_data[:, 1], pot_data[:, 2], pot_data[:, 3]
     XG, XF, YG, YF = pot_data[:, 4], pot_data[:, 5], pot_data[:, 6], pot_data[:, 7]

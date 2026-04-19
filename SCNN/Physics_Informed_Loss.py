@@ -895,45 +895,66 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
 
     loss_physical_state = loss_pos_energy + loss_kin_pos
 
-    # ═══════ 损失 5: 光滑性（合并形状+边界+端点）═══════
-    # 边界端点
-    loss_boundary_g = torch.mean(g[:, 0] ** 2 + g[:, -1] ** 2)
-    loss_boundary_f = torch.mean(f[:, 0] ** 2)
-    loss_boundary = loss_boundary_g + loss_boundary_f
+    # ══════ 损失 5: 光滑性（纯防锯齿，无形态假设）═══════
+    # ★ 2026-04-19 大手术: 删除tail/mono/boundary, 只保留曲率+TV+HF谱
 
-    # 曲率光滑性
+    # --- 二阶差分: 曲度 ---
+    #   2. 全域TV: 对任意频率振荡敏感
+    #   3. 高频谱能量: FFT直接切除Gibbs
+    # 删除项:
+    #   - loss_tail (尾部集中性): 强制把峰推向近核区 → 压成台阶状!
+    #   - loss_mono (包络单调): 形态假设, 错误时反而锁死错误形状
+    #   - loss_boundary (端点+远场TV): 与Model_Architecture的硬约束重复
+
+    # --- (保留) 二阶差分: 曲率 ---
     d2g = g[:, 2:] - 2 * g[:, 1:-1] + g[:, :-2]
     d2f = f[:, 2:] - 2 * f[:, 1:-1] + f[:, :-2]
-    roughness = torch.mean(d2g ** 2) + torch.mean(d2f ** 2)
+    loss_curvature = torch.mean(d2g ** 2) + torch.mean(d2f ** 2)
 
-    # 远场TV惩罚
-    bidx = min(max(int(15.0 / dr), 10), npt - 2)
-    g_far = g[:, bidx:]
-    f_far = f[:, bidx:]
-    tv_g_far = torch.abs(g_far[:, 1:] - g_far[:, :-1]).sum(dim=-1).mean()
-    tv_f_far = torch.abs(f_far[:, 1:] - f_far[:, :-1]).sum(dim=-1).mean()
-    loss_tv_far = tv_g_far + tv_f_far * 3.0
+    # ★ 保留: 全域一阶总变差(TV)
+    tv_g = torch.abs(g[:, 1:] - g[:, :-1]).sum(dim=-1).mean()
+    tv_f = torch.abs(f[:, 1:] - f[:, :-1]).sum(dim=-1).mean()
+    loss_tv_global = tv_g + tv_f * 3.0
 
-    # 尾部集中性
-    tail_start = min(int(10.0 / dr), npt - 1)
-    if tail_start < npt - 1:
-        total_prob = prob_density.sum(dim=-1, keepdim=True)
-        tail_prob = prob_density[:, tail_start:].sum(dim=-1, keepdim=True)
-        tail_ratio = tail_prob / (total_prob.clamp(min=1e-10))
-        loss_tail = torch.mean(torch.clamp(tail_ratio - 0.02, min=0) ** 2) * 50.0
+    # ★ 保留: 高频谱能量惩罚
+    try:
+        with torch.amp.autocast('cuda', enabled=False):
+            g_fft = torch.fft.rfft(g.float())
+            f_fft = torch.fft.rfft(f.float())
+            n_freq = g_fft.size(-1)
+            hf_cutoff = max(n_freq // 2, 5)
+            if hf_cutoff < n_freq - 1:
+                hf_g_energy = (g_fft[:, hf_cutoff:].abs() ** 2).sum(dim=-1).mean()
+                hf_f_energy = (f_fft[:, hf_cutoff:].abs() ** 2).sum(dim=-1).mean()
+            else:
+                hf_g_energy = torch.tensor(0.0, device=device)
+                hf_f_energy = torch.tensor(0.0, device=device)
+            loss_hf_spectrum = hf_g_energy + hf_f_energy * 3.0
+    except Exception:
+        loss_hf_spectrum = torch.tensor(0.0, device=device)
+
+    loss_smoothness = loss_curvature + loss_tv_global * 2.0 + loss_hf_spectrum
+
+    # ══════ 损失 5.5: 尾部概率集中惩罚（★ 2026-04-19 新增） ══════
+    # 物理依据（教材3.60: G(R)=0, F(R)=C_R）：
+    #   束缚态波函数在远场应指数衰减 → 0，1s1/2 态在 r>6fm 时 |g|<0.01
+    #   配合 Model_Architecture.py 中 r_cutoff=8.0 的硬约束使用
+    #
+    # 诊断问题：图像显示 pred_g 在 r=5~15fm 区间维持 ~0.25 的平台，
+    #            而该区域 true_g ≈ 0 → 归一化后峰高被压低 ~2.3倍
+    # 策略：软惩罚尾部概率占比（非硬截断），让网络自然学会将概率集中到核区
+    prob_density = g ** 2 + f ** 2  # (B, N)
+    total_prob = torch.sum(prob_density, dim=-1, keepdim=True) * dr  # (B, 1) — 应≈1.0(归一化后)
+    tail_start_idx = min(int(8.0 / dr), npt - 1)  # r > 8 fm 开始算尾部
+    if tail_start_idx < npt - 1:
+        tail_prob = prob_density[:, tail_start_idx:].sum(dim=-1, keepdim=True) * dr  # (B, 1)
+        tail_ratio = tail_prob / total_prob.clamp(min=1e-10)  # 尾部概率占比
+        # ★ 束缚态尾部概率应 < 5%（对1s1/2态实际<0.1%，留余量）
+        #   仅在超限时惩罚（ReLU），正常态不触发
+        loss_tail_concentration = torch.mean(torch.clamp(tail_ratio - 0.05, min=0.0) ** 2) * 20.0
     else:
-        loss_tail = torch.tensor(0.0, device=device)
+        loss_tail_concentration = torch.tensor(0.0, device=device)
 
-    # 包络单调性
-    abs_g = torch.abs(g)
-    peak_pos = torch.argmax(abs_g[:, max(5, int(5.0/dr)):], dim=-1) + max(5, int(5.0/dr))
-    arange_L = torch.arange(npt, device=device).unsqueeze(0).expand(B, -1)
-    env_diff = abs_g[:, 1:] - abs_g[:, :-1]
-    right_diff_mask = (arange_L[:, 1:] > peak_pos.unsqueeze(-1)).float()
-    mono_violation = torch.clamp(env_diff * right_diff_mask, min=0) ** 2
-    loss_mono = torch.mean(mono_violation) * 10.0
-
-    loss_smoothness = roughness + loss_tv_far + loss_tail + loss_mono + loss_boundary * 0.1
 
     # ═══════ 损失 6: Rayleigh商能量一致性 ═══════
     r_safe = r.clone()
@@ -960,6 +981,7 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
         'loss_node': loss_node,
         'loss_physical_state': loss_physical_state,
         'loss_smoothness': loss_smoothness,
+        'loss_tail_concentration': loss_tail_concentration,  # ★ 2026-04-19 新增
         'loss_energy_rayleigh': loss_energy_rayleigh,
         # 诊断信息
         'norm_integral': norm_integral.detach().mean(),
@@ -969,7 +991,7 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
         'vps_core': vps_core,
         'vms_core': vms_core,
         # 总损失
-        'loss_total': loss_pde + loss_norm + loss_node + loss_physical_state + loss_smoothness + loss_energy_rayleigh,
+        'loss_total': loss_pde + loss_norm + loss_node + loss_physical_state + loss_smoothness + loss_tail_concentration + loss_energy_rayleigh,
     }
 
 
