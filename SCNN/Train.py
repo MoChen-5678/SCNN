@@ -364,25 +364,41 @@ def train_model():
     weight_decay = 1e-4
     use_self_attention = True  # ★ 启用轨道自注意力
 
-    # --- ★ 极简损失（5+1项：data主导 + 物理软引导）---
-    # ★ 核心原则: data MSE绝对统治, 物理损失仅做软引导/安全护栏
+    # --- ★ 物理优先损失函数（Physics-First PINN Paradigm）---
     #
-    #   保留6项:
-    #     1. lambda_data=10      — 绝对主导! 唯一含"正确波形"信息的信号
-    #     2. lambda_pde=1        — PDE残差物理引导(轻量)
-    #     3. lambda_norm=0.5     — 归一化保险(架构已有硬约束)
-    #     4. lambda_smooth=2     — 曲率+TV+HF谱防锯齿
-    #     5. lambda_rayleigh=1   — Rayleigh商能量一致性(自注意力物理验证!)
-    #        权重从3→1: "软引导"非"硬锁死", 循环依赖被data=10压制
-    #     6. lambda_physical=0.5 — 正能量+动能正定性(纯安全护栏)
-    #   删除: node/tail/mono/boundary (形态假设压成台阶状)
-    lambda_data = 5.0         # ★ 绝对主导!
-    lambda_pde = 1.0           # PDE物理引导（轻量）
-    lambda_norm = 0.5          # 归一化（架构已硬归一化, 仅保险）
-    lambda_smooth = 2.0        # 光滑性（曲率+TV+HF谱, 无形态假设）
-    lambda_tail = 2.0          # ★ 尾部概率集中（配合r_cut=8fm，引导波形局域化）
-    lambda_rayleigh = 1.0      # ★ Rayleigh商能量一致性（软引导权重）
-    lambda_physical = 1.0      # ★ 正能量态+动能正定性（纯护栏）
+    # ★ 核心原则变更(2026-04-19): 从"数据主导+物理软引导" → "物理主导+数据校准"
+    #
+    #   物理动机：
+    #     Dirac方程的解空间由以下约束唯一确定：
+    #       1. PDE残差 → 波函数满足微分方程本征值问题
+    #       2. 归一化 → 概率守恒 ∫(G²+F²)dr = 1
+    #       3. Rayleigh商 → 能量本征值 ε = <ψ|H|ψ>/<ψ|ψ> 自洽
+    #       4. 正能量态 → 排除负能海假解 (E_kin > 0)
+    #       5. Ansatz边界 → G~r^{l_u+1}, F~r^{l_d+1} (架构层硬约束)
+    #
+    #     数据MSE的角色：仅提供波形形状的"粗略轮廓"参考。
+    #     如果数据与物理矛盾（如数据含数值噪声或近似误差），
+    #     网络应以物理定律为准，而非盲目拟合数据。
+    #
+    #   权重层级设计：
+    #     [L1] 绝对物理约束（违反即非物理解，零容忍）:
+    #         lambda_pde = 10.0     Dirac方程残差 — 微分方程本身!
+    #         lambda_rayleigh = 5.0  能量自洽性 — 本征值问题!
+    #         lambda_norm = 2.0      归一化 — 概率守恒!
+    #         lambda_physical = 3.0   正能量态 — 排除负能海!
+    #     [L2] 物理正则化（改善解质量但不改变解的存在性）:
+    #         lambda_smooth = 0.5    光滑性 — H^1正则化, 防锯齿
+    #         lambda_tail = 1.0      尾部局域化 — 束缚态特征
+    #     [L3] 数据辅助（仅做形状引导，绝不凌驾于物理之上）:
+    #         lambda_data = 0.5       轻量MSE — "波形大概长这样"
+    #
+    lambda_pde = 10.0           # L1: Dirac PDE残差（绝对主导）
+    lambda_rayleigh = 5.0      # L1: Rayleigh商能量自洽
+    lambda_physical = 3.0       # L1: 正能量态+动能正定性
+    lambda_norm = 2.0           # L1: 归一化约束
+    lambda_smooth = 0.5         # L2: 光滑性正则化
+    lambda_tail = 1.0           # L2: 尾部概率集中
+    lambda_data = 0.5           # L3: 数据MSE辅助（轻量校准）
 
     # ★ f分量MSE加权系数
     f_mse_weight = 5.0
@@ -472,7 +488,7 @@ def train_model():
         print(f"   🔄 自注意力: {'ON (OrbitalSelfAttention)' if use_self_attention else 'OFF (PhysicsCrossAttention)'}")
         print(f"   📚 课程学习: Phase1(Ep1-{curriculum_phase1_epochs}) {len(PHASE1_STATES)}态 → Phase2(Ep{curriculum_phase1_epochs+1}-{curriculum_phase2_epochs}) {len(PHASE2_STATES)}态 → Phase3(Ep{curriculum_phase2_epochs+1}-{num_epochs}) {len(PHASE3_STATES)}态")
         print(f"   🎯 核素: {phase1_isotopes} (仅2核素)")
-        print(f"   📊 精简损失: 6项核心损失 (PDE+Norm+Node+PhysicalState+Smoothness+Rayleigh)")
+        print(f"   📊 Physics-First损失: PDE={lambda_pde}, Rayleigh={lambda_rayleigh}, Physical={lambda_physical}, Norm={lambda_norm}, Data={lambda_data} (物理主导)")
 
     # ================================================================
     #   课程学习：阶段1 初始化
@@ -632,40 +648,56 @@ def train_model():
             train_loader.sampler.set_epoch(epoch)
 
         # ══════════════════════════════════════
-        # 物理损失权重调度（★ 新增warm-up）
+        # 物理优先权重调度（Physics-First Schedule）
         #
-        # 原问题: 第一epoch就全量启用6个物理损失(总权重=41)，
-        #         网络还没学会基本波形形状就被强约束锁死到delta局部最优
+        # ★ 核心变更(2026-04-19): 从"物理逐步引入" → "物理始终主导,数据逐步引入"
         #
-        # ★ warm-up (6项: data永远全开, 物理逐步引入)
-        #   Phase 1 (Ep 1-30):   Data+PDE+Norm(半), 波形形状优先
-        #   Phase 2 (Ep 31-80):  引入Smooth+Rayleigh+Physical, 物理一致性
-        #   Phase 3 (Ep 81+):    全部6项
-        phy_warmup_epochs_p1 = 30
-        phy_warmup_epochs_p2 = 80
+        #   原策略问题:
+        #     前30个epoch几乎只有data MSE → 网络学会拟合数据中的数值噪声
+        #     物理约束太晚介入 → 已形成的非物理解被"锁定"
+        #
+        #   新策略（三层级）:
+        #     Phase 1 (Ep 1-50):   PDE+Norm+Physical 全量 + Data=0.1(极轻)
+        #         目标: 先让网络学会"什么是合法的Dirac波函数"
+        #     Phase 2 (Ep 51-150): 引入Rayleigh(能量自洽) + Smooth + Tail,
+        #                           Data逐步增至0.5
+        #         目标: 加入能量本征值约束，同时让数据微调波形形状
+        #     Phase 3 (Ep 151+):    全部7项满载
+        #         目标: 精细平衡物理与数据的最终解
+        #
+        phy_warmup_epochs_p1 = 50
+        phy_warmup_epochs_p2 = 150
 
         if epoch <= phy_warmup_epochs_p1:
-            eff_lambda_pde = lambda_pde * 0.5
-            eff_lambda_norm = lambda_norm * 0.5
-            eff_lambda_smooth = 0.0
-            eff_lambda_tail = 0.0          # ★ 新增
-            eff_lambda_rayleigh = 0.0
-            eff_lambda_physical = 0.0
+            # Phase 1: 物理硬约束优先 — 数据仅做极弱引导
+            eff_lambda_pde = lambda_pde                    # PDE全量!
+            eff_lambda_norm = lambda_norm                  # 归一化全量!
+            eff_lambda_physical = lambda_physical           # 正能量态全量!
+            eff_lambda_rayleigh = lambda_rayleigh * 0.3    # 能量稍缓引入
+            eff_lambda_smooth = 0.0                        # 光滑稍后
+            eff_lambda_tail = 0.0                          # 尾部稍后
+            eff_lambda_data = lambda_data * 0.2            # 极轻数据引导
+
         elif epoch <= phy_warmup_epochs_p2:
+            # Phase 2: 完整物理约束 + 数据逐步增强
             progress = (epoch - phy_warmup_epochs_p1) / (phy_warmup_epochs_p2 - phy_warmup_epochs_p1)
-            eff_lambda_pde = lambda_pde * (0.5 + 0.5 * progress)
-            eff_lambda_norm = lambda_norm * (0.5 + 0.5 * progress)
-            eff_lambda_smooth = lambda_smooth * progress * 0.8
-            eff_lambda_tail = lambda_tail * progress * 0.8           # ★ 新增：尾部集中
-            eff_lambda_rayleigh = lambda_rayleigh * progress * 0.5  # 更晚引入
-            eff_lambda_physical = lambda_physical * progress * 0.5
-        else:
             eff_lambda_pde = lambda_pde
             eff_lambda_norm = lambda_norm
-            eff_lambda_smooth = lambda_smooth
-            eff_lambda_tail = lambda_tail       # ★ 新增
-            eff_lambda_rayleigh = lambda_rayleigh
             eff_lambda_physical = lambda_physical
+            eff_lambda_rayleigh = lambda_rayleigh * (0.3 + 0.7 * progress)  # Rayleigh逐步全开
+            eff_lambda_smooth = lambda_smooth * progress
+            eff_lambda_tail = lambda_tail * progress
+            eff_lambda_data = lambda_data * (0.2 + 0.8 * progress)          # 数据逐步增至满载
+
+        else:
+            # Phase 3: 全部满载
+            eff_lambda_pde = lambda_pde
+            eff_lambda_norm = lambda_norm
+            eff_lambda_physical = lambda_physical
+            eff_lambda_rayleigh = lambda_rayleigh
+            eff_lambda_smooth = lambda_smooth
+            eff_lambda_tail = lambda_tail
+            eff_lambda_data = lambda_data
 
         # 学习率调度
         if current_phase == 3:
@@ -741,11 +773,11 @@ def train_model():
                     loss_physical = phy_components['loss_physical_state']
                     loss_tail_c = phy_components.get('loss_tail_concentration', torch.tensor(0.0, device=device))
 
-                    # ★ 损失组合（6项物理 + 1项数据主导）
+                    # ★ 损失组合（物理优先：6项L1/L2约束 + 1项L3数据辅助）
                     loss_phy = (eff_lambda_pde * loss_pde +
                                 eff_lambda_norm * loss_norm +
                                 eff_lambda_smooth * loss_smooth +
-                                eff_lambda_tail * loss_tail_c +         # ★ 新增
+                                eff_lambda_tail * loss_tail_c +
                                 eff_lambda_rayleigh * loss_rayleigh +
                                 eff_lambda_physical * loss_physical)
                 else:
@@ -756,8 +788,8 @@ def train_model():
                     loss_physical = torch.tensor(0.0, device=device)
                     loss_phy = torch.tensor(0.0, device=device)
 
-                # ★ 总损失 = 弱MSE辅助 + 强物理主导
-                loss = (lambda_data * loss_data + loss_phy) / grad_accum_steps
+                # ★ 总损失 = 物理主导 + 数据辅助校准（Physics-First Paradigm）
+                loss = (eff_lambda_data * loss_data + loss_phy) / grad_accum_steps
 
             scaler.scale(loss).backward()
 
