@@ -3,6 +3,32 @@ import torch
 # 全局参考尺度：在首次调用时自动估算，后续用于归一化
 _ref_scale = None
 
+# ★ v9 全局 FD 矩阵缓存（消除 O(N³) for 循环瓶颈）
+#   原代码每次 forward 都在 Python for 循环中逐元素构建 N×N 矩阵，
+#   每次 Loss 计算调用 6 次 → 数万次 CPU-GPU kernel launch
+#   缓存后：相同(n, dr, direction)只构建一次，后续直接复用
+_FD_MATRIX_CACHE = {}
+
+def get_cached_fd_matrix_5padf(n: int, dr: float, direction: str = 'forward',
+                                device=None, dtype=None):
+    """带全局缓存的 5PADF 矩阵获取器（训练速度提升 10~50x 的核心）"""
+    if device is None:
+        device = 'cpu'
+    if dtype is None:
+        dtype = torch.float32
+    cache_key = (n, dr, direction, str(device), str(dtype))
+    if cache_key not in _FD_MATRIX_CACHE:
+        matrix = _build_fd_matrix_5padf(n, dr, direction=direction,
+                                         device=device, dtype=dtype)
+        _FD_MATRIX_CACHE[cache_key] = matrix.detach().clone()
+    return _FD_MATRIX_CACHE[cache_key]
+
+
+def clear_fd_cache():
+    """清空缓存（仅在网格参数变化时调用）"""
+    global _FD_MATRIX_CACHE
+    _FD_MATRIX_CACHE.clear()
+
 
 # ═══════════════════════════════════════════════════════════════
 #   ★ 2026-04-19 新增：全局有限差分矩阵构建器（Wang et al. 2025 5PADF 方案）
@@ -142,8 +168,8 @@ def _build_fd_matrix_5padf(n: int, dr: float, direction: str = 'forward',
 
 
 def _build_fd_matrix(n: int, dr: float, order: int = 4, device=None, dtype=None):
-    """兼容性别装：默认使用 forward-5PADF。新代码建议直接调用 _build_fd_matrix_5padf(direction=...)"""
-    return _build_fd_matrix_5padf(n, dr, direction='forward', device=device, dtype=dtype)
+    """v9: 兼容性别装，走缓存路径"""
+    return get_cached_fd_matrix_5padf(n, dr, direction='forward', device=device, dtype=dtype)
 
 
 def _apply_fd_matrix(signal, D_matrix):
@@ -302,8 +328,8 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     #   新方案：基于 Wang et al. (2025) Chin.Phys.C 的 5PADF 非对称差分公式
     #   ★ 核心：G(大分量)用forward, F(小分量)用backward → 保证Dirac哈密顿量厄米性
     # ================================================================
-    D_g = _build_fd_matrix_5padf(npt, dr, direction='forward', device=device)   # G: 前向
-    D_f = _build_fd_matrix_5padf(npt, dr, direction='backward', device=device)  # F: 后向
+    D_g = get_cached_fd_matrix_5padf(npt, dr, direction='forward', device=device)   # G: 前向
+    D_f = get_cached_fd_matrix_5padf(npt, dr, direction='backward', device=device)  # F: 后向
     dg_full = _apply_fd_matrix(g, D_g)   # (B, N) — G的导数用前向差分
     df_full = _apply_fd_matrix(f, D_f)   # (B, N) — F的导数用后向差分
     
@@ -339,9 +365,14 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     # 结合能 ε (MeV) — 这是 Dirac Hamiltonian 的本征值，直接对应网络输出
     energy_rayleigh = rayleigh_numerator / (rayleigh_denominator.clamp(min=1e-10))
 
-    # 网络输出的能量（专用标量能量头）直接与之对齐
+    # 网络输出的能量（专用标量能量头）
     energy_network_scalar = E.squeeze(-1)  # (B,) — 也是结合能 [MeV]
-    loss_energy_rayleigh = torch.mean((energy_rayleigh - energy_network_scalar) ** 2)
+    
+    # ★ v9 梯度阻断 (Master-Slave Locking):
+    #   能量读数器 loss：让网络标量输出逼近当前波函数的真实 Rayleigh 能量
+    #   detach() 阻止能量误差的梯度回传到波函数，打破"左脚踩右脚"死循环
+    #   物理依据：能量由波函数形态决定(Rayleigh商)，标量只是"仪表盘读数"
+    loss_energy_rayleigh = torch.mean((energy_network_scalar - energy_rayleigh.detach()) ** 2)
 
     # 同时保存Rayleigh能量供后续使用
     energy_E = energy_rayleigh.detach()  # (B,)
@@ -478,8 +509,8 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     #
     # ★ 2026-04-19 修复：使用5PADF交替差分（G:forward, F:backward）
     # ================================================================
-    D_g_kin = _build_fd_matrix_5padf(npt, dr, direction='forward', device=device)
-    D_f_kin = _build_fd_matrix_5padf(npt, dr, direction='backward', device=device)
+    D_g_kin = get_cached_fd_matrix_5padf(npt, dr, direction='forward', device=device)
+    D_f_kin = get_cached_fd_matrix_5padf(npt, dr, direction='backward', device=device)
     dg_full_kin = _apply_fd_matrix(g, D_g_kin)
     df_full_kin = _apply_fd_matrix(f, D_f_kin)
 
@@ -859,12 +890,14 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
         flip = (peak_vals < 0).float().unsqueeze(-1)  # (B, 1)
         return g_out * flip - g_out * (1 - flip), f_out * flip - f_out * (1 - flip), peak_indices
 
-    g_aligned, f_aligned, _peak_indices = _align_phase(g, f)
-
-    # 后续所有约束使用相位对齐后的 g_aligned, f_aligned
-    # 替换原有 g, f 引用
-    g = g_aligned
-    f = f_aligned
+    # ★ v9 禁用训练期相位翻转：
+    #   _align_phase 在波函数接近零时，微小噪声(1e-5)可导致正负判定翻转，
+    #   整个波形瞬间乘以-1 → PDE 残差爆炸
+    #   PDE 方程对全局符号免疫 (ψ 和 -ψ 都是解)，训练中自然坍缩到固定符号
+    #   相位对齐仅在推理(Inference)阶段输出最终波形供查看时才需要
+    # g_aligned, f_aligned, _peak_indices = _align_phase(g, f)
+    # g = g_aligned
+    # f = f_aligned
 
     # ================================================================
     #   ★ 能量与势场诊断信息输出
@@ -1084,8 +1117,8 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
 
     # 动能正定性
     # ★ 2026-04-19 修复：使用5PADF交替差分（G:forward, F:backward）
-    D_g_s = _build_fd_matrix_5padf(npt, dr, direction='forward', device=device)
-    D_f_s = _build_fd_matrix_5padf(npt, dr, direction='backward', device=device)
+    D_g_s = get_cached_fd_matrix_5padf(npt, dr, direction='forward', device=device)
+    D_f_s = get_cached_fd_matrix_5padf(npt, dr, direction='backward', device=device)
     dg_full = _apply_fd_matrix(g, D_g_s)
     df_full = _apply_fd_matrix(f, D_f_s)
     kin_term_diff = -g * df_full + f * dg_full
@@ -1175,7 +1208,8 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     energy_rayleigh = rayleigh_numerator / (rayleigh_denominator.clamp(min=1e-10))  # 结合能 [MeV]
 
     energy_network_scalar = E.squeeze(-1)  # 网络输出的结合能 [MeV]
-    loss_energy_rayleigh = torch.mean((energy_rayleigh - energy_network_scalar) ** 2)
+    # ★ v9 梯度阻断：同 calc_physics_residual，阻止能量误差回传波函数
+    loss_energy_rayleigh = torch.mean((energy_network_scalar - energy_rayleigh.detach()) ** 2)
 
     # ═══════ 诊断信息 ═══════
     vps_core = vps[:, :min(int(6.0/dr), npt)].detach().mean()
@@ -1273,8 +1307,8 @@ class RHFConsistencyChecker:
 
         # 4阶差分
         # ★ 2026-04-19 修复：使用5PADF交替差分（G:forward, F:backward）
-        D_g_chk = _build_fd_matrix_5padf(npt, dr, direction='forward', device=device)
-        D_f_chk = _build_fd_matrix_5padf(npt, dr, direction='backward', device=device)
+        D_g_chk = get_cached_fd_matrix_5padf(npt, dr, direction='forward', device=device)
+        D_f_chk = get_cached_fd_matrix_5padf(npt, dr, direction='backward', device=device)
         dg_dr = _apply_fd_matrix(g, D_g_chk)   # (B, N) — 完整导数
         df_dr = _apply_fd_matrix(f, D_f_chk)   # (B, N)
 
