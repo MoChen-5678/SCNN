@@ -777,27 +777,23 @@ class RHF_FNO_GRU(nn.Module):
 
         # ★ 2026-04-19 真空边界条件修复：
         #
-        # 致命缺陷（旧代码）：
-        #   other_fields = raw * scale + bias
-        #   bias是全局常数（不依赖r），导致所有势场在 r→∞ 处不归零！
-        #   物理后果：σ, ω, ρ介子场在核外区域保持非零值
-        #            → Dirac方程中的 V(r) 不满足渐近自由边界条件
-        #            → 束缚态能谱整体偏移
+        # ★ 严格的真空边界截断：整个势场必须在远区归零
         #
-        # RMF模型正确行为：
-        #   所有平均势在核外(r > R_nucleus ~ 8fm)必须指数衰减至真空值(0或常数)
-        #   标量势 S(r) → 0,  矢量势 V_0(r) → 0 (对束缚态)
+        # 物理诊断（代数错误）：
+        #   FNO 是全局傅里叶算子，输出在 r→∞ 时全空间震荡，不会自然归零
+        #   旧代码: other_fields * scale + bias * vacuum_mask
+        #     → other_fields * scale 在远场仍有非零震荡值！
+        #     → 核子在 15 fm 真空中仍感受到 σ, ω 介子场 — 完全破坏渐近自由边界！
+        #   新代码: (other_fields * scale + bias) * vacuum_mask
+        #     → 整个势场被掩码切断，远区强制指数衰减至真空(0)
         #
-        # 实现方案：用平滑的阶跃函数将 bias 调制为空间依赖的
-        #   vacuum_mask = sigmoid((r_cutoff - r) * steepness)
-        #   r < r_cutoff: mask ≈ 1.0 (核区，bias完全生效)
-        #   r > r_cutoff: mask ≈ 0.0 (远区，bias被抑制，势场趋向原始输出)
         r_for_vacuum = r_max if r_max.dim() == 2 else r_max.unsqueeze(0).expand(B, -1)
         r_vacuum_cutoff = 8.0  # fm — 大约是Pb核半径的2倍
         vacuum_steepness = 2.0  # 控制过渡带宽度: steepness越大过渡越陡峭
-        vacuum_mask = torch.sigmoid((r_vacuum_cutoff - r_for_vacuum) * vacuum_steepness).unsqueeze(1)  # (B, 1, N) — 与 bias (B, 9, 1) 广播兼容
+        vacuum_mask = torch.sigmoid((r_vacuum_cutoff - r_for_vacuum) * vacuum_steepness).unsqueeze(1)  # (B, 1, N)
 
-        other_fields = other_fields * scale + bias * vacuum_mask
+        # ★ 对整体施加掩码！确保远区势场 = 0
+        other_fields = (other_fields * scale + bias) * vacuum_mask
 
         # ===== ★ 专用本征能量预测（标量输出）=====
         # ★ 2026-04-19 关键架构修复：

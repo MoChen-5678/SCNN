@@ -200,7 +200,7 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     # 根据核物理教材第3章，单粒子能量ε是Dirac方程的本征值
     # 不是网络直接回归的目标，而是从波函数和势场自然涌现
     hbc = 197.328284
-    M_nucleon = 939.0  # 核子质量 MeV
+    # ★ v5: M_nucleon 已移除 — Rayleigh商直接计算结合能ε，无需静止质量
     
     # 从网络输出获取初始能量猜测（仅用于PDE计算）
     # ★ 2026-04-19 关键修复：优先使用专用能量预测头的标量输出
@@ -306,48 +306,43 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     dg_full = _apply_fd_matrix(g, D_g)   # (B, N) — G的导数用前向差分
     df_full = _apply_fd_matrix(f, D_f)   # (B, N) — F的导数用后向差分
     
-    # 计算哈密顿量作用在波函数上的结果（Dirac方程左侧）
-    # hψ 的第一个分量: -df/dr - (κ/r)f + [Σ_+ + M]g
-    # hψ 的第二个分量: +dg/dr + (κ/r)g + [Σ_- - M]f
-    kappa_exp_full = kappa.unsqueeze(1)
+    # ================================================================
+    #   ★ 2026-04-19 v5 修复：量纲统一的物理精确 Rayleigh 商（直接计算结合能 ε）
+    #
+    #   物理诊断（量纲分析）：
+    #     r 单位: fm → 导数 df/dr 单位: fm⁻¹
+    #     vps (Σ_+) 来自网络，用于 u2g = E_hc - vps，其中 E_hc = E/(ħc) [fm⁻¹]
+    #     ⇒ vps 单位也是 fm⁻¹（量级 ±0.5）
+    #     M_nucleon = 939.0 [MeV] — ★ 绝对不能直接与 fm⁻¹ 量级的项相加！
+    #
+    #   开创性推导：从 PDE 残差定义出发
+    #     E_hc · G = -dF/dr + (κ/r)F + vps·G      (E_hc = ε/ħc, 全部 fm⁻¹)
+    #   两边同乘 ħc:
+    #     ε · G = ħc · [ -dF/dr + (κ/r)F + vps·G ]
+    #   ⇒ 结合能 ε 的 Rayleigh 商分子 = ħc × (微分项+势场项)，无需 M_nucleon！
+    #
+    #   量纲统一为 MeV：所有 fm⁻¹ 的项必须乘以 hbc (=197.328284 MeV·fm)
+    # ================================================================
     r_safe = r.clone()
     r_safe[r_safe < 1e-10] = 1e-10  # 防止除零
-    
-    # Σ_+ ≈ vps (标量势+矢量势组合), Σ_- ≈ vms
-    # 这里简化处理，使用vps和vms作为有效势
-    Sigma_plus = vps  # 上分量有效势
-    Sigma_minus = vms  # 下分量有效势
-    
-    # hψ 的两个分量
-    # ★ 2026-04-19 关键修复：修正自旋轨道耦合项符号
-    # 文献依据：龙文辉《核物理计算实践》公式(3.57a)
-    #   正确公式: h_ψ_g = -dF/dr + (κ/r)*F + [Σ_+ + M]*G
-    #   原错误:   h_ψ_g = -dF/dr - (κ/r)*F + [Σ_+ + M]*G  ← κ/r项符号反了！
-    #   物理后果：loss_pde与loss_energy_rayleigh产生对抗梯度，模型无法收敛
-    h_psi_g = -df_full + (kappa_exp_full / r_safe) * f + (Sigma_plus + M_nucleon) * g
-    h_psi_f = dg_full + (kappa_exp_full / r_safe) * g + (Sigma_minus - M_nucleon) * f
-    
-    # Rayleigh商分子: <ψ|h|ψ> = ∫(g * h_psi_g + f * h_psi_f)dr
-    # 注意：这里使用实数波函数，内积为∫(G*h_G + F*h_F)dr
-    rayleigh_numerator = torch.sum((g * h_psi_g + f * h_psi_f) * dr, dim=1)
+    kappa_exp_full = kappa.unsqueeze(1)  # ★ κ 张量，用于自旋轨道耦合 (κ/r) 项
+
+    # 直接用 PDE 有效势定义，乘 hbc 转换到 MeV
+    # Σ_+ ≈ vps, Σ_- ≈ vms （有效势，单位 fm⁻¹，乘 hbc 后变为 MeV）
+    h_psi_g_binding = hbc * (-df_full + (kappa_exp_full / r_safe) * f + vps * g)
+    h_psi_f_binding = hbc * (dg_full + (kappa_exp_full / r_safe) * g + vms * f)
+
+    # Rayleigh商分子: <ψ|h|ψ> = ∫(g·h_ψ_g + f·h_ψ_f)dr  【单位: MeV】
+    rayleigh_numerator = torch.sum((g * h_psi_g_binding + f * h_psi_f_binding) * dr, dim=1)
     rayleigh_denominator = torch.sum((g**2 + f**2) * dr, dim=1)
-    
-    # 能量期望值（Rayleigh商）- 这是包含核子质量的总能量
-    energy_rayleigh_total = rayleigh_numerator / (rayleigh_denominator.clamp(min=1e-10))
-    
-    # ★ 关键修正：单粒子能量 ε 应该是单核子结合能（扣除静止质量）
-    # 根据教材第3章，能量泛函中的动能项和势能项都不包含静止质量
-    # ε = E_total - M_nucleon （单位：MeV）
-    energy_rayleigh = energy_rayleigh_total - M_nucleon
-    
-    # 网络输出的能量（用于比较）- 网络输出也应该是结合能
-    energy_network = E.squeeze(-1)  # (B,)
-    
-    # ★ 关键：能量一致性损失
-    # 如果波函数是正确的Dirac本征态，Rayleigh商应该等于网络输出的能量
-    # 这个损失驱动网络学习正确的波函数形状，使能量自然涌现
-    loss_energy_rayleigh = torch.mean((energy_rayleigh - energy_network) ** 2)
-    
+
+    # 结合能 ε (MeV) — 这是 Dirac Hamiltonian 的本征值，直接对应网络输出
+    energy_rayleigh = rayleigh_numerator / (rayleigh_denominator.clamp(min=1e-10))
+
+    # 网络输出的能量（专用标量能量头）直接与之对齐
+    energy_network_scalar = E.squeeze(-1)  # (B,) — 也是结合能 [MeV]
+    loss_energy_rayleigh = torch.mean((energy_rayleigh - energy_network_scalar) ** 2)
+
     # 同时保存Rayleigh能量供后续使用
     energy_E = energy_rayleigh.detach()  # (B,)
 
@@ -980,7 +975,7 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     YF = pred_tensor[:, 8, :]
 
     hbc = 197.328284
-    M_nucleon = 939.0
+    # ★ v5: M_nucleon 已移除 — Rayleigh商直接计算结合能ε，无需静止质量
 
     # ★ 2026-04-19 关键修复：优先使用专用能量预测头的标量输出
     if predicted_energy is not None:
@@ -1136,19 +1131,22 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
 
 
     # ═══════ 损失 6: Rayleigh商能量一致性 ═══════
+    # ================================================================
+    #   ★ 2026-04-19 v5 修复：量纲统一的 Rayleigh 商（同 calc_physics_residual）
+    #   彻底移除 M_nucleon，所有 fm⁻¹ 项乘 hbc 转换为 MeV
+    # ================================================================
     r_safe = r.clone()
     r_safe[r_safe < 1e-10] = 1e-10
-    Sigma_plus = vps
-    Sigma_minus = vms
-    # ★ 2026-04-19 关键修复：同上，修正 h_psi_g 中 κ/r 项的符号（- → +）
-    # 原错误导致 Rayleigh 商能量与 PDE 残差对抗
-    h_psi_g = -df_full + (kappa_exp / r_safe) * f + (Sigma_plus + M_nucleon) * g
-    h_psi_f = dg_full + (kappa_exp / r_safe) * g + (Sigma_minus - M_nucleon) * f
-    rayleigh_numerator = torch.sum((g * h_psi_g + f * h_psi_f) * dr, dim=1)
+
+    # 直接用 PDE 有效势定义，乘 hbc 转换到 MeV（无需 M_nucleon）
+    h_psi_g_binding = hbc * (-df_full + (kappa_exp / r_safe) * f + vps * g)
+    h_psi_f_binding = hbc * (dg_full + (kappa_exp / r_safe) * g + vms * f)
+
+    rayleigh_numerator = torch.sum((g * h_psi_g_binding + f * h_psi_f_binding) * dr, dim=1)
     rayleigh_denominator = torch.sum((g**2 + f**2) * dr, dim=1)
-    energy_rayleigh_total = rayleigh_numerator / (rayleigh_denominator.clamp(min=1e-10))
-    energy_rayleigh = energy_rayleigh_total - M_nucleon
-    energy_network_scalar = E.squeeze(-1)
+    energy_rayleigh = rayleigh_numerator / (rayleigh_denominator.clamp(min=1e-10))  # 结合能 [MeV]
+
+    energy_network_scalar = E.squeeze(-1)  # 网络输出的结合能 [MeV]
     loss_energy_rayleigh = torch.mean((energy_rayleigh - energy_network_scalar) ** 2)
 
     # ═══════ 诊断信息 ═══════
@@ -1236,7 +1234,8 @@ class RHFConsistencyChecker:
         vps = pred_tensor[:, 2, :]
         vms = pred_tensor[:, 3, :]
 
-        M_nucleon = 939.0
+        # M_nucleon 已移除 — v5 Rayleigh商直接计算结合能ε，无需静止质量
+        hbc = 197.328284  # MeV·fm — 量纲转换常数
 
         # 网格
         r = torch.arange(0, npt, device=device, dtype=torch.float32) * dr
@@ -1256,14 +1255,17 @@ class RHFConsistencyChecker:
         df_full = df_dr
 
         # Rayleigh能量
+        # ================================================================
+        #   ★ 2026-04-19 v5 修复：量纲统一的 Rayleigh 商（同上）
+        #   移除 M_nucleon，乘 hbc 转换为 MeV
+        # ================================================================
         r_safe = r.clone()
         r_safe[r_safe < 1e-10] = 1e-10
-        # ★ 2026-04-19 关键修复：同上，修正 h_psi_g 中 κ/r 项的符号（- → +）
-        h_psi_g = -df_full + (kappa_exp / r_safe) * f + (vps + M_nucleon) * g
-        h_psi_f = dg_full + (kappa_exp / r_safe) * g + (vms - M_nucleon) * f
-        rayleigh_num = torch.sum((g * h_psi_g + f * h_psi_f) * dr, dim=1)
+        h_psi_g_binding = hbc * (-df_full + (kappa_exp / r_safe) * f + vps * g)
+        h_psi_f_binding = hbc * (dg_full + (kappa_exp / r_safe) * g + vms * f)
+        rayleigh_num = torch.sum((g * h_psi_g_binding + f * h_psi_f_binding) * dr, dim=1)
         rayleigh_den = torch.sum((g**2 + f**2) * dr, dim=1)
-        E_rayleigh = rayleigh_num / (rayleigh_den.clamp(min=1e-10)) - M_nucleon
+        E_rayleigh = rayleigh_num / (rayleigh_den.clamp(min=1e-10))  # 结合能 [MeV]（无需减M）
 
         # 网络输出能量
         # ★ 2026-04-19: 优先使用专用能量预测头的标量输出
