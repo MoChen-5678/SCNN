@@ -241,8 +241,11 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     E_hc = E / hbc
     r1 = kappa_exp / r
 
+    # ★ v7: 恢复丢失的 2Mc² 非对称耦合项（详见下方注释）
+    M_hc = 939.0 / hbc  # ≈ 4.758 fm⁻¹
+
     u1g = r1 + vtt + XG
-    u1f = E_hc - vms - XF
+    u1f = E_hc + 2.0 * M_hc - vms - XF       # ★ G'方程: (ε+2M-Σ_-)F
     u2f = r1 + vtt + YF
     u2g = E_hc - vps - YG
 
@@ -322,15 +325,20 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     #   ⇒ 结合能 ε 的 Rayleigh 商分子 = ħc × (微分项+势场项)，无需 M_nucleon！
     #
     #   量纲统一为 MeV：所有 fm⁻¹ 的项必须乘以 hbc (=197.328284 MeV·fm)
+    #
+    # ★ v7: 恢复丢失的 2Mc² — F 分量哈密顿量含非对称质量项
+    #   h_ψ_g = -dF/dr + (κ/r)F + Σ_+·G          （G 方程无 M）
+    #   h_ψ_f = +dG/dr + (κ/r)G + (2M - Σ_-)·F   ← ★ F 方程含 2M！
     # ================================================================
     r_safe = r.clone()
     r_safe[r_safe < 1e-10] = 1e-10  # 防止除零
-    kappa_exp_full = kappa.unsqueeze(1)  # ★ κ 张量，用于自旋轨道耦合 (κ/r) 项
+    kappa_exp_full = kappa.unsqueeze(1)  # ★ κ 张量
+    M_hc = 939.0 / hbc  # ≈ 4.758 fm⁻¹
 
     # 直接用 PDE 有效势定义，乘 hbc 转换到 MeV
-    # Σ_+ ≈ vps, Σ_- ≈ vms （有效势，单位 fm⁻¹，乘 hbc 后变为 MeV）
     h_psi_g_binding = hbc * (-df_full + (kappa_exp_full / r_safe) * f + vps * g)
-    h_psi_f_binding = hbc * (dg_full + (kappa_exp_full / r_safe) * g + vms * f)
+    # ★ v7: h_ψ_f 中 F 的系数是 (2M - Σ_-)，不是 (-Σ_-)！
+    h_psi_f_binding = hbc * (dg_full + (kappa_exp_full / r_safe) * g + (2.0 * M_hc - vms) * f)
 
     # Rayleigh商分子: <ψ|h|ψ> = ∫(g·h_ψ_g + f·h_ψ_f)dr  【单位: MeV】
     rayleigh_numerator = torch.sum((g * h_psi_g_binding + f * h_psi_f_binding) * dr, dim=1)
@@ -458,11 +466,10 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     f_dominance = integral_f2 - 0.3 * integral_g2      # f 过强的指标
     loss_f_too_large = torch.mean(torch.clamp(f_dominance, min=0.0) ** 2)
 
-    # 2. ★ v6: 防非相对论坍缩 (F→0 优化器捷径阻断)
-    f_lower_bound = 0.002 * integral_g2 - integral_f2   # ∫f² ≥ 0.002·∫g²
-    loss_f_too_small = torch.mean(torch.clamp(f_lower_bound, min=0.0) ** 2) * 100.0
-
-    loss_positive_energy = loss_f_too_large + loss_f_too_small
+    # v7: 撤销 loss_f_too_small（v6 的严厉 F 下限约束）
+    # 原因：PDE 已修正为含 2Mc² 非对称耦合项，网络会自然学到正确 F 尺度
+    #       无需人为强制下限，让物理方程本身驱动 F 分量
+    loss_positive_energy = loss_f_too_large
 
     # ================================================================
     #   ★ 约束 7：动能正定性约束（防震荡假解）
@@ -1003,8 +1010,11 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     E_hc = E / hbc
     r1 = kappa_exp / r
 
+    # ★ v7: 2Mc² 非对称耦合项（同 calc_physics_residual）
+    M_hc = 939.0 / hbc
+
     u1g = r1 + vtt + XG
-    u1f = E_hc - vms - XF
+    u1f = E_hc + 2.0 * M_hc - vms - XF       # ★ G'方程: (ε+2M-Σ_-)F
     u2f = r1 + vtt + YF
     u2g = E_hc - vps - YG
 
@@ -1076,11 +1086,8 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     #     即 ∫f² / ∫(g²+f²) ≥ 0.005（保守估计）
     #     等价于 ∫f² ≥ 0.005 · ∫g² （因为 g 占主导）
     #
-    f_lower_bound = 0.002 * integral_g2 - integral_f2  # 要求 ∫f² ≥ 0.002·∫g²
-    # 如果 F 坍缩，施加极其严厉的惩罚（权重100），把优化器逼出死角
-    loss_f_too_small = torch.mean(torch.clamp(f_lower_bound, min=0.0) ** 2) * 100.0
-
-    loss_pos_energy = loss_f_too_large + loss_f_too_small
+    # v7: 撤销 F 下限约束（PDE 2Mc² 已修正，物理方程自然驱动正确尺度）
+    loss_pos_energy = loss_f_too_large
 
     # 动能正定性
     # ★ 2026-04-19 修复：使用5PADF交替差分（G:forward, F:backward）
@@ -1165,10 +1172,12 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     # ================================================================
     r_safe = r.clone()
     r_safe[r_safe < 1e-10] = 1e-10
+    M_hc = 939.0 / hbc  # ★ v7: 恢复2M耦合项
 
-    # 直接用 PDE 有效势定义，乘 hbc 转换到 MeV（无需 M_nucleon）
+    # 直接用 PDE 有效势定义，乘 hbc 转换到 MeV
     h_psi_g_binding = hbc * (-df_full + (kappa_exp / r_safe) * f + vps * g)
-    h_psi_f_binding = hbc * (dg_full + (kappa_exp / r_safe) * g + vms * f)
+    # ★ v7: F 哈密顿量含 (2M - Σ_-)，非对称质量项
+    h_psi_f_binding = hbc * (dg_full + (kappa_exp / r_safe) * g + (2.0 * M_hc - vms) * f)
 
     rayleigh_numerator = torch.sum((g * h_psi_g_binding + f * h_psi_f_binding) * dr, dim=1)
     rayleigh_denominator = torch.sum((g**2 + f**2) * dr, dim=1)
@@ -1289,8 +1298,10 @@ class RHFConsistencyChecker:
         # ================================================================
         r_safe = r.clone()
         r_safe[r_safe < 1e-10] = 1e-10
+        M_hc = 939.0 / hbc  # ★ v7: 恢复2M耦合项
         h_psi_g_binding = hbc * (-df_full + (kappa_exp / r_safe) * f + vps * g)
-        h_psi_f_binding = hbc * (dg_full + (kappa_exp / r_safe) * g + vms * f)
+        # ★ v7: F 哈密顿量含 (2M - Σ_-)，非对称质量项
+        h_psi_f_binding = hbc * (dg_full + (kappa_exp / r_safe) * g + (2.0 * M_hc - vms) * f)
         rayleigh_num = torch.sum((g * h_psi_g_binding + f * h_psi_f_binding) * dr, dim=1)
         rayleigh_den = torch.sum((g**2 + f**2) * dr, dim=1)
         E_rayleigh = rayleigh_num / (rayleigh_den.clamp(min=1e-10))  # 结合能 [MeV]（无需减M）
