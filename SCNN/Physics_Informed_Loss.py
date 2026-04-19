@@ -453,8 +453,16 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     # ================================================================
     integral_g2 = torch.sum(g ** 2, dim=1) * dr       # (B,)  ∫g²dr
     integral_f2 = torch.sum(f ** 2, dim=1) * dr       # (B,)  ∫f²dr
+
+    # 1. 防负能量海崩溃 (F 不能过大)
     f_dominance = integral_f2 - 0.3 * integral_g2      # f 过强的指标
-    loss_positive_energy = torch.mean(torch.clamp(f_dominance, min=0.0) ** 2)
+    loss_f_too_large = torch.mean(torch.clamp(f_dominance, min=0.0) ** 2)
+
+    # 2. ★ v6: 防非相对论坍缩 (F→0 优化器捷径阻断)
+    f_lower_bound = 0.002 * integral_g2 - integral_f2   # ∫f² ≥ 0.002·∫g²
+    loss_f_too_small = torch.mean(torch.clamp(f_lower_bound, min=0.0) ** 2) * 100.0
+
+    loss_positive_energy = loss_f_too_large + loss_f_too_small
 
     # ================================================================
     #   ★ 约束 7：动能正定性约束（防震荡假解）
@@ -1047,12 +1055,32 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
                     torch.mean(torch.clamp(0.5 - g_crossings, min=0)) * \
                     torch.mean(torch.clamp(g[:, :r_sign_loose].mean(dim=1), max=0))
 
-    # ═══════ 损失 4: 物理态约束（合并正能量+动能正定性）═══════
-    # 正能量态：∫f² 应小于 0.3·∫g²
+    # ═══════ 损失 4: 物理态约束（合并正能量+动能正定性+F下限保护）═══════
     integral_g2 = torch.sum(g ** 2, dim=1) * dr
     integral_f2 = torch.sum(f ** 2, dim=1) * dr
-    f_dominance = integral_f2 - 0.3 * integral_g2
-    loss_pos_energy = torch.mean(torch.clamp(f_dominance, min=0.0) ** 2)
+
+    # 1. 防负能量海崩溃 (F 不能过大，上限为 0.3)
+    f_upper_bound = integral_f2 - 0.3 * integral_g2
+    loss_f_too_large = torch.mean(torch.clamp(f_upper_bound, min=0.0) ** 2)
+
+    # 2. ★ v6: 防非相对论坍缩 (F 不能为零！切断 F→0 的优化器捷径)
+    #
+    #   物理诊断：
+    #     网络发现"让 F→0"是完美的偷懒策略：
+    #       - E_kin = ∫(-G·F' + F·G' + ...)dr → F=0 时 E_kin≈0 → 完美避开动能惩罚
+    #       - PDE残差中 Rf 权重虽×3，但 F 本身已消失，残差极小
+    #     这导致模型迅速掉入 F=0 的局部极小值（Trivial Vacuum），再也无法逃离
+    #
+    #   物理下限：
+    #     对于核子束缚态，小分量概率通常至少占总概率的 0.5% ~ 5%
+    #     即 ∫f² / ∫(g²+f²) ≥ 0.005（保守估计）
+    #     等价于 ∫f² ≥ 0.005 · ∫g² （因为 g 占主导）
+    #
+    f_lower_bound = 0.002 * integral_g2 - integral_f2  # 要求 ∫f² ≥ 0.002·∫g²
+    # 如果 F 坍缩，施加极其严厉的惩罚（权重100），把优化器逼出死角
+    loss_f_too_small = torch.mean(torch.clamp(f_lower_bound, min=0.0) ** 2) * 100.0
+
+    loss_pos_energy = loss_f_too_large + loss_f_too_small
 
     # 动能正定性
     # ★ 2026-04-19 修复：使用5PADF交替差分（G:forward, F:backward）

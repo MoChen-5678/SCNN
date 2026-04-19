@@ -417,17 +417,14 @@ class RHF_FNO_GRU(nn.Module):
         self.other_bias = nn.Parameter(torch.zeros(9))   # 9个通道的偏移
 
         # 指数衰减系数网络 (预测 alpha 以施加无穷远边界约束)
+        # ★ v6: 仅输出单一 alpha，G 和 F 共用相同衰减指数
+        # 物理依据：r→∞ 时 Dirac 方程退化为自由粒子，G~F~exp(-αr)
+        #           两者的区别仅在于前置常数系数(v/c ~ 0.05)，而非衰减率
         self.alpha_net = nn.Sequential(
             nn.Linear(gru_hidden, 64),
             nn.GELU(),
-            nn.Linear(64, 1),  # ★ 仅输出 alpha_g（1维），alpha_f 由 alpha_g + f_alpha_offset 推导
+            nn.Linear(64, 1),
         )
-
-        # ★ f 分量独立衰减偏移量（可学习）
-        # 物理动机：小分量 f 的渐近行为由 (κ/r + V) 决定，比大分量 g 衰减更快
-        # alpha_f = alpha_g * (1 + softplus(f_alpha_offset))
-        # 初始值=0.5 → softplus(0.5)≈0.97 → alpha_f ≈ 1.97 * alpha_g，f衰减约2倍快
-        self.f_alpha_offset = nn.Parameter(torch.tensor(0.5))
 
         # --- 6. 进度投影层（正式初始化，不再懒初始化）---
         self._progress_proj = nn.Linear(self.gru_input_size + 1, self.gru_input_size, bias=False)
@@ -650,16 +647,23 @@ class RHF_FNO_GRU(nn.Module):
         # 正确顺序：
         #   新顺序：raw → Sobolev平滑(消除高频噪声) → ansatz_mask(r^{l+1}·e^{-αr})
         #   物理依据：平滑操作是线性算子，与幂律掩码可交换(理想情况)
-        #             但由于卷积边界效应，必须先平滑再掩码才能保持精确的 r=0 行为
+        # ===== ★ Sobolev 平滑正则化 + v6相对论预缩放 =====
         gf_raw = torch.stack([raw_g, raw_f], dim=1)  # (B, 2, N)
-        gf_smoothed = self.sobolev_smooth(gf_raw)       # (B, 2, N) — 消除FNO高频噪声
-        raw_g = gf_smoothed[:, 0, :]                     # 平滑后的raw g
-        raw_f = gf_smoothed[:, 1, :]                     # 平滑后的raw f
+        gf_smoothed = self.sobolev_smooth(gf_raw)
+
+        raw_g = gf_smoothed[:, 0, :]
+        # ★ v6 相对论自然尺度预缩放：F 物理量级 ≈ 0.05 × G (v/c ~ 5%)
+        # 网络只需输出 O(1) 的平缓信号，改善 F 梯度流，防止 F→0 坍缩
+        raw_f = gf_smoothed[:, 1, :] * 0.05
 
         # 预测衰减系数（控制远场指数衰减）
         alpha_g_raw = self.alpha_net(enhanced_hidden)
         alpha_g = (0.1 + 2.9 * torch.sigmoid(alpha_g_raw)).squeeze(-1)
-        alpha_f = alpha_g * (1.0 + F.softplus(self.f_alpha_offset))
+
+        # ★ v6: G 和 F 必须拥有完全相同的衰减指数！
+        # r→∞ 时自由 Dirac 方程: G,F ∝ exp(-αr)，区别仅在常数系数
+        alpha_f = alpha_g
+
         alpha_g = alpha_g.unsqueeze(1)
         alpha_f = alpha_f.unsqueeze(1)
 
