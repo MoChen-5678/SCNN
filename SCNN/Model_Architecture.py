@@ -441,9 +441,33 @@ class RHF_FNO_GRU(nn.Module):
         nn.init.normal_(self._wavefunc_proj.weight, std=0.01)
 
         # --- 8. Sobolev 平滑正则化层 (消除锯齿) ---
-        # 在 ansatz mask 之后、硬归一化之前对 g/f 做可学习平滑
+        # 在 ansatz mask 之前对 raw g/f 做可学习平滑（★ 2026-04-19 修复顺序）
         # channels=2 对应 g 和 f 两个通道
         self.sobolev_smooth = SobolevSmoother(channels=2, kernel_size=5)
+
+        # --- 9. ★ 专用本征能量预测头（标量输出） ---
+        # ★ 2026-04-19 关键架构修复：
+        #
+        # 致命缺陷（旧代码）：
+        #   能量 ε 被建模为空间场(通道9)，通过 .mean(dim=-1) 取平均得到标量
+        #   问题：浪费网络容量（201个网格点全部用于预测同一个标量）
+        #         违反量子力学基本原理（能量是全局算子的本征值，不是局域量）
+        #         mean()平均会引入噪声和空间伪影
+        #
+        # 正确设计：
+        #   从GRU隐状态(已编码全空间信息)直接映射到标量能量
+        #   架构: gru_hidden → FC64 → GELU → FC1 → ε (MeV)
+        #   优势：(1) 参数效率高(64+1 vs 201个独立预测)
+        #         (2) 物理正确(全局特征→全局标量)
+        #         (3) 梯度信号集中(不分散到201个网格点)
+        self.energy_predictor = nn.Sequential(
+            nn.Linear(gru_hidden, 64),
+            nn.GELU(),
+            nn.Linear(64, 1),  # 输出单个标量: 束缚态能量 ε
+        )
+        # 初始化: 典型束缚态能量 ~ -30 MeV (16O 1s1/2)
+        with torch.no_grad():
+            self.energy_predictor[2].bias.fill_(-30.0)
 
     def _normalize_zn(self, z_num, n_num):
         """将 (Z, N) 归一化到 [0, 1] 附近，便于 MLP 学习"""
@@ -614,6 +638,24 @@ class RHF_FNO_GRU(nn.Module):
         raw_g = pred_x[:, 0, :]
         raw_f = pred_x[:, 1, :]
 
+        # ===== ★ Sobolev 平滑正则化 (消除锯齿) =====
+        # ★ 2026-04-19 关键修复：在 ansatz mask 之前对原始网络输出做平滑
+        #
+        # 致命缺陷（旧代码）：
+        #   旧顺序：raw → ansatz_mask(r^{l+1}) → Sobolev平滑 → 归一化
+        #   问题：Sobolev卷积的Binomial核 [1,4,6,4,1]/16 在边界处会"泄漏"非零值
+        #         导致 r=0 处 G(r)≠0（破坏 r^{l_u+1} 渐近行为）
+        #         κ/r·G 或 κ/r·F 项在原点虚假发散 → Rayleigh商能量偏移
+        #
+        # 正确顺序：
+        #   新顺序：raw → Sobolev平滑(消除高频噪声) → ansatz_mask(r^{l+1}·e^{-αr})
+        #   物理依据：平滑操作是线性算子，与幂律掩码可交换(理想情况)
+        #             但由于卷积边界效应，必须先平滑再掩码才能保持精确的 r=0 行为
+        gf_raw = torch.stack([raw_g, raw_f], dim=1)  # (B, 2, N)
+        gf_smoothed = self.sobolev_smooth(gf_raw)       # (B, 2, N) — 消除FNO高频噪声
+        raw_g = gf_smoothed[:, 0, :]                     # 平滑后的raw g
+        raw_f = gf_smoothed[:, 1, :]                     # 平滑后的raw f
+
         # 预测衰减系数（控制远场指数衰减）
         alpha_g_raw = self.alpha_net(enhanced_hidden)
         alpha_g = (0.1 + 2.9 * torch.sigmoid(alpha_g_raw)).squeeze(-1)
@@ -699,13 +741,7 @@ class RHF_FNO_GRU(nn.Module):
         g_constrained = g_constrained * (1 - 2 * flip_sign)
         f_constrained = f_constrained * (1 - 2 * flip_sign)
 
-        # ===== ★ Sobolev 平滑正则化 (消除锯齿) =====
-        # 在 ansatz mask 之后、归一化之前对 g/f 做可学习平滑
-        # 将 g,f 堆叠为 (B, 2, N) 输入 SobolevSmoother
-        gf_constrained = torch.stack([g_constrained, f_constrained], dim=1)  # (B, 2, N)
-        gf_smoothed = self.sobolev_smooth(gf_constrained)  # (B, 2, N)
-        g_constrained = gf_smoothed[:, 0, :]
-        f_constrained = gf_smoothed[:, 1, :]
+        # Sobolev平滑已移至ansatz mask之前（见上方Step 7开头），此处不再重复
 
         # ===== 硬狄拉克归一化 =====
         g_sq = g_constrained ** 2
@@ -738,9 +774,42 @@ class RHF_FNO_GRU(nn.Module):
         # 逐通道缩放: pred_ch * scale_ch + bias_ch
         scale = self.other_scale.view(1, 9, 1)
         bias = self.other_bias.view(1, 9, 1)
-        other_fields = other_fields * scale + bias
+
+        # ★ 2026-04-19 真空边界条件修复：
+        #
+        # 致命缺陷（旧代码）：
+        #   other_fields = raw * scale + bias
+        #   bias是全局常数（不依赖r），导致所有势场在 r→∞ 处不归零！
+        #   物理后果：σ, ω, ρ介子场在核外区域保持非零值
+        #            → Dirac方程中的 V(r) 不满足渐近自由边界条件
+        #            → 束缚态能谱整体偏移
+        #
+        # RMF模型正确行为：
+        #   所有平均势在核外(r > R_nucleus ~ 8fm)必须指数衰减至真空值(0或常数)
+        #   标量势 S(r) → 0,  矢量势 V_0(r) → 0 (对束缚态)
+        #
+        # 实现方案：用平滑的阶跃函数将 bias 调制为空间依赖的
+        #   vacuum_mask = sigmoid((r_cutoff - r) * steepness)
+        #   r < r_cutoff: mask ≈ 1.0 (核区，bias完全生效)
+        #   r > r_cutoff: mask ≈ 0.0 (远区，bias被抑制，势场趋向原始输出)
+        r_for_vacuum = r_max if r_max.dim() == 2 else r_max.unsqueeze(0).expand(B, -1)
+        r_vacuum_cutoff = 8.0  # fm — 大约是Pb核半径的2倍
+        vacuum_steepness = 2.0  # 控制过渡带宽度: steepness越大过渡越陡峭
+        vacuum_mask = torch.sigmoid((r_vacuum_cutoff - r_for_vacuum) * vacuum_steepness).unsqueeze(1)  # (B, 1, N) — 与 bias (B, 9, 1) 广播兼容
+
+        other_fields = other_fields * scale + bias * vacuum_mask
+
+        # ===== ★ 专用本征能量预测（标量输出）=====
+        # ★ 2026-04-19 关键架构修复：
+        #   从GRU隐状态(已编码全空间波函数+势场信息)直接映射到标量能量
+        #   ε = energy_predictor(enhanced_hidden) → (B, 1)
+        #   物理依据：能量是Dirac Hamiltonian的全局本征值，不是局域空间场
+        predicted_energy = self.energy_predictor(enhanced_hidden)  # (B, 1)
 
         # 拼接最终输出
         final_pred_x = torch.cat([g_ansatz, f_ansatz, other_fields], dim=1)
 
-        return final_pred_x  # (B, 11, N)
+        # 返回: (场预测, 标量能量)
+        #   final_pred_x: (B, 11, N) — 完整的物理场（g, f, 势场等）
+        #   predicted_energy: (B, 1) — 束缚态本征能量 ε (MeV)
+        return final_pred_x, predicted_energy

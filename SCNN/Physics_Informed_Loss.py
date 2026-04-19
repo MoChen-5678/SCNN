@@ -153,12 +153,13 @@ def _apply_fd_matrix(signal, D_matrix):
 
 def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
                           dr=0.10, ref_scale=None, return_components=True,
-                          n_principal=None, y_true=None):
+                          n_principal=None, y_true=None, predicted_energy=None):
     """
     计算狄拉克方程的物理残差，返回可独立加权的分量。
 
     ★ 加强版：引入主量子数 n_principal 做精确节点数约束
     ★ 新增：峰值位置匹配损失 loss_peak（需要 y_true）
+    ★ 2026-04-19: 新增 predicted_energy 参数（专用标量能量头输出）
 
     参数：
     ------
@@ -170,6 +171,7 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     return_components: True返回dict，False返回标量
     n_principal: (B,) ★ 主量子数，用于精确节点数约束
     y_true: (B, 11, N) ★ 真实标签（可选），用于峰值位置匹配损失
+    predicted_energy: (B, 1) 或 (B,) ★ 2026-04-19新增：模型专用能量头输出的标量能量
 
     返回值：
     ------
@@ -201,7 +203,18 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     M_nucleon = 939.0  # 核子质量 MeV
     
     # 从网络输出获取初始能量猜测（仅用于PDE计算）
-    E_network = pred_tensor[:, 9, :].mean(dim=1, keepdim=True)
+    # ★ 2026-04-19 关键修复：优先使用专用能量预测头的标量输出
+    #   旧方法: E_network = pred_tensor[:, 9, :].mean(dim=1)
+    #     问题：能量被建模为201维空间场，.mean()平均引入噪声和空间伪影
+    #   新方法: E_network = predicted_energy (B,1) — 从GRU隐状态直接映射的全局标量
+    #           如果未提供predicted_energy（向后兼容），则回退到旧方法
+    if predicted_energy is not None:
+        E_network = predicted_energy.view(-1, 1)  # 确保形状 (B, 1)
+        # 兼容性检查: 确保在正确设备上
+        if device is not None and E_network.device != device:
+            E_network = E_network.to(device)
+    else:
+        E_network = pred_tensor[:, 9, :].mean(dim=1, keepdim=True)  # 向后兼容
     
     # ★ 从Dirac方程计算能量期望值
     # 根据教材公式(3.57)，能量本征值满足：
@@ -942,11 +955,13 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
 #     - loss_peak: 物理态约束+光滑性已覆盖峰值位置
 # ═══════════════════════════════════════════════════════════════
 
-def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_true=None):
+def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_true=None,
+                              predicted_energy=None):
     """
     精简版物理残差计算：仅6个核心损失，去除冗余。
 
     参数与 calc_physics_residual 相同（stats_mean/stats_std/ref_scale不再需要）。
+    ★ 2026-04-19: 新增 predicted_energy 参数（专用标量能量头输出）
 
     返回: dict 包含6个核心损失 + 诊断信息
     """
@@ -967,7 +982,13 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     hbc = 197.328284
     M_nucleon = 939.0
 
-    E_network = pred_tensor[:, 9, :].mean(dim=1, keepdim=True)
+    # ★ 2026-04-19 关键修复：优先使用专用能量预测头的标量输出
+    if predicted_energy is not None:
+        E_network = predicted_energy.view(-1, 1)
+        if E_network.device != device:
+            E_network = E_network.to(device)
+    else:
+        E_network = pred_tensor[:, 9, :].mean(dim=1, keepdim=True)  # 向后兼容
     E = E_network
 
     # 网格坐标
@@ -1196,9 +1217,12 @@ class RHFConsistencyChecker:
                                 'vps_core', 'vms_core', 'norm_integral',
                                 'consistency_residual'])
 
-    def compute_consistency(self, pred_tensor, kappa, dr=0.10, n_principal=None):
+    def compute_consistency(self, pred_tensor, kappa, dr=0.10, n_principal=None,
+                           predicted_energy=None):
         """
         计算RHF一致性指标和残差。
+
+        ★ 2026-04-19: 新增 predicted_energy 参数（专用标量能量头输出）
 
         返回:
           consistency_residual: 标量损失，可反向传播
@@ -1242,7 +1266,13 @@ class RHFConsistencyChecker:
         E_rayleigh = rayleigh_num / (rayleigh_den.clamp(min=1e-10)) - M_nucleon
 
         # 网络输出能量
-        E_network = pred_tensor[:, 9, :].mean(dim=1)
+        # ★ 2026-04-19: 优先使用专用能量预测头的标量输出
+        if predicted_energy is not None:
+            E_network = predicted_energy.view(-1)
+            if E_network.device != device:
+                E_network = E_network.to(device)
+        else:
+            E_network = pred_tensor[:, 9, :].mean(dim=1)  # 向后兼容
 
         # 动能
         kin_term_diff = -g * df_full + f * dg_full

@@ -290,9 +290,12 @@ def _evaluate(model, dataloader, device, stats_mean, stats_std, y_mean, y_std,
         x_norm = normalize(x_batch, stats_mean, stats_std)
 
         with torch.no_grad():
-            y_pred = model(x_norm, kappa_true, batch_r_grid,
+            model_output = model(x_norm, kappa_true, batch_r_grid,
                             is_proton=is_proton, z_num=z_num, n_num=n_num,
                             n_principal=n_principal)
+            # ★ 2026-04-19: 模型返回 (场预测, 标量能量) 元组
+            y_pred = model_output[0] if isinstance(model_output, tuple) else model_output
+            predicted_energy = model_output[1] if isinstance(model_output, tuple) else None
 
             # ★ 分通道MSE: g/f(0,1)在物理空间, 其余通道用y_stats归一化后
             loss_gf = nn.functional.mse_loss(y_pred[:, :2, :], y_true[:, :2, :])
@@ -306,7 +309,8 @@ def _evaluate(model, dataloader, device, stats_mean, stats_std, y_mean, y_std,
                     y_pred, kappa_true, y_mean, y_std,
                     dr=0.10, return_components=True,
                     n_principal=n_principal,
-                    y_true=y_true  # ★ 传入真实标签用于loss_peak
+                    y_true=y_true,  # ★ 传入真实标签用于loss_peak
+                    predicted_energy=predicted_energy  # ★ 2026-04-19: 传入标量能量
                 )
                 loss_pde_val = phy_comp['loss_pde'].item()
                 loss_norm_val = phy_comp['loss_norm'].item()
@@ -742,9 +746,12 @@ def train_model():
             # ★ Y不再用X的stats归一化！g/f通道在物理空间计算MSE，其余通道用Y自己的stats
 
             with autocast('cuda'):
-                y_pred = model(x_seq_norm, kappa, batch_r_grid,
+                model_output = model(x_seq_norm, kappa, batch_r_grid,
                                     is_proton=is_proton, z_num=z_num, n_num=n_num,
                                     n_principal=n_principal)  # ★ 传入主量子数
+                # ★ 2026-04-19: 模型返回 (场预测, 标量能量) 元组
+                y_pred = model_output[0] if isinstance(model_output, tuple) else model_output
+                pred_energy = model_output[1] if isinstance(model_output, tuple) else None
 
                 # ★ 分通道MSE计算（f加权5.0）：
                 # g通道(0): 权重1.0, f通道(1): 权重5.0（f比g小1-2量级，需加权补偿）
@@ -764,7 +771,8 @@ def train_model():
                         kappa=kappa,
                         dr=dr,
                         n_principal=n_principal,
-                        y_true=y_true
+                        y_true=y_true,
+                        predicted_energy=pred_energy  # ★ 2026-04-19: 传入标量能量
                     )
                     loss_pde = phy_components['loss_pde']
                     loss_norm = phy_components['loss_norm']
@@ -866,11 +874,15 @@ def train_model():
         if is_main:
             # ★ 从精简损失获取诊断信息
             with torch.no_grad():
-                sample_y_ph = model(x_seq_norm, kappa, batch_r_grid,
+                sample_output = model(x_seq_norm, kappa, batch_r_grid,
                                     is_proton=is_proton, z_num=z_num, n_num=n_num,
                                     n_principal=n_principal)
+                # ★ 2026-04-19: 模型返回 (场预测, 标量能量) 元组
+                sample_y_ph = sample_output[0] if isinstance(sample_output, tuple) else sample_output
+                sample_pred_energy = sample_output[1] if isinstance(sample_output, tuple) else None
                 phy_diag = calc_simplified_residual(
-                    sample_y_ph, kappa, dr=dr, n_principal=n_principal, y_true=y_true
+                    sample_y_ph, kappa, dr=dr, n_principal=n_principal, y_true=y_true,
+                    predicted_energy=sample_pred_energy  # ★ 2026-04-19: 传入标量能量
                 )
                 E_rayleigh_val = phy_diag.get('energy_rayleigh', torch.tensor(0.0)).item() if isinstance(phy_diag.get('energy_rayleigh'), torch.Tensor) else 0.0
                 E_network_val = phy_diag.get('energy_network', torch.tensor(0.0)).item() if isinstance(phy_diag.get('energy_network'), torch.Tensor) else 0.0
@@ -902,9 +914,11 @@ def train_model():
             # 物理验证
             if epoch % plot_interval == 0 or epoch == 1:
                 with torch.no_grad():
-                    sample_y_pred = model(x_seq_norm, kappa, batch_r_grid,
+                    sample_output = model(x_seq_norm, kappa, batch_r_grid,
                                          is_proton=is_proton, z_num=z_num, n_num=n_num,
                                          n_principal=n_principal)
+                    # ★ 2026-04-19: 模型返回 (场预测, 标量能量) 元组
+                    sample_y_pred = sample_output[0] if isinstance(sample_output, tuple) else sample_output
                     norm_vals, is_norm = verify_normalization(
                         sample_y_pred, batch_r_grid, kappa, dr=dr,
                         stats_mean=y_mean, stats_std=y_std
