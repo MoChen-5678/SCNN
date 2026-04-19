@@ -61,3 +61,11 @@ Epoch [ 10/3700] | Phase1(核心束缚态) | LR: 1.00e-04
   [6损失] Total: 1759.8039 | Data: 62.1680(×0.5) | PDE: 0.7306(10.0) | Norm: 0.0001(2.0)
          Smooth: 144.2761(0.5) | Tail: 0.0000(1.0) | Rayleigh: 1164.187378(5.0) | Physical: 0.000000(3.0)
   [诊断] E_rayleigh=-71.93 MeV | E_network=-44.18 MeV | E_kin=0.03 | norm=1.010101
+Epoch [ 15/3700] | Phase1(核心束缚态) | LR: 1.00e-04
+  [6损失] Total: 4036.5916 | Data: 61.8999(×0.5) | PDE: 0.3697(10.0) | Norm: 0.0001(2.0)
+         Smooth: 196.0494(0.5) | Tail: 0.0000(1.0) | Rayleigh: 2684.469482(5.0) | Physical: 0.000102(3.0)
+  [诊断] E_rayleigh=-96.01 MeV | E_network=-50.57 MeV | E_kin=0.01 | norm=1.010101
+Epoch [ 20/3700] | Phase1(核心束缚态) | LR: 1.00e-04
+  [6损失] Total: 11240.1655 | Data: 61.6086(×0.5) | PDE: 0.2154(10.0) | Norm: 0.0001(2.0)
+         Smooth: 214.4669(0.5) | Tail: 0.0000(1.0) | Rayleigh: 7487.900391(5.0) | Physical: 0.000056(3.0)
+  [诊断] E_rayleigh=-133.63 MeV | E_network=-56.16 MeV | E_kin=0.01 | norm=1.010101

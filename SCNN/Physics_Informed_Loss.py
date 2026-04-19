@@ -890,14 +890,12 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
         flip = (peak_vals < 0).float().unsqueeze(-1)  # (B, 1)
         return g_out * flip - g_out * (1 - flip), f_out * flip - f_out * (1 - flip), peak_indices
 
-    # ★ v9 禁用训练期相位翻转：
-    #   _align_phase 在波函数接近零时，微小噪声(1e-5)可导致正负判定翻转，
-    #   整个波形瞬间乘以-1 → PDE 残差爆炸
-    #   PDE 方程对全局符号免疫 (ψ 和 -ψ 都是解)，训练中自然坍缩到固定符号
-    #   相位对齐仅在推理(Inference)阶段输出最终波形供查看时才需要
-    # g_aligned, f_aligned, _peak_indices = _align_phase(g, f)
-    # g = g_aligned
-    # f = f_aligned
+    g_aligned, f_aligned, _peak_indices = _align_phase(g, f)
+
+    # 后续所有约束使用相位对齐后的 g_aligned, f_aligned
+    # 替换原有 g, f 引用
+    g = g_aligned
+    f = f_aligned
 
     # ================================================================
     #   ★ 能量与势场诊断信息输出
