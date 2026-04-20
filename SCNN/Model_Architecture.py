@@ -655,12 +655,8 @@ class RHF_FNO_GRU(nn.Module):
 
         raw_g = gf_smoothed[:, 0, :]
 
-        # ★ v8 相对论先验尺度注入：
-        #   F 是狄拉克旋量的"小分量"，物理幅度天然为 G 的 v/c ≈ 0.05 倍
-        #   网络输出 raw_f ~ O(1)，但目标 F ~ O(0.05)
-        #   主动注入尺度因子，使网络用 O(1) 参数表达 O(0.05) 精细结构
-        #   物理依据：自由 Dirac 解 F/G → (E-M)/(E+M) ≈ p/(2M) ≈ 0.05
-        raw_f = gf_smoothed[:, 1, :] * 0.05
+        # ★ v15: 移除0.05暴力缩放 — 物理方程已自洽，网络会自然学到F/G≈v/c
+        raw_f = gf_smoothed[:, 1, :]
 
         # 预测衰减系数（控制远场指数衰减）
         alpha_g_raw = self.alpha_net(enhanced_hidden)

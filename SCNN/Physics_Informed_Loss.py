@@ -267,9 +267,13 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     E_hc = E / hbc
     r1 = kappa_exp / r
 
-    # 训练数据中能量已是结合能 ε = E_total - M，PDE体系与之一致，无需补2M
+    # ★ v15: PDE耦合系数必须包含 +2M（vms是纯Σ_−，未减去2M！）
+    #   铁证: 数据中 vms_core ≈ +576 MeV = 纯 Σ_− = V - S
+    #   若已减2M: 应为 576 - 1878 = -1301 MeV ← 但实际不是!
+    #   Dirac方程正确形式: G' = (ε + 2M - Σ_−)·F → Python必须显式加2M
+    M_hc = 939.0 / hbc  # 核子静质量 / ħc ≈ 4.76 fm⁻¹
     u1g = r1 + vtt + XG
-    u1f = E_hc - vms - XF
+    u1f = E_hc + 2.0 * M_hc - vms - XF   # ★ +2M: 否则系数符号反转!
     u2f = r1 + vtt + YF
     u2g = E_hc - vps - YG
 
@@ -348,12 +352,13 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     r_safe[r_safe < 1e-10] = 1e-10
     kappa_exp_full = kappa.unsqueeze(1)
 
-    # ★ v12: 撤销v11的M_hc质量项（错误添加）
-    #   Fortran Expect.f262-264 加了 amu/hbc*(G²-F²), 但L267立即减去amu*xn
-    #   对于单粒子(xn≈1,<G²>≈1): M净贡献 ≈ amu*1 - amu*1 ≈ 0
-    #   原v11只加了M没减 → E_rayleigh偏移+931MeV → 震荡根因!
+    # ★ v15: 严格对齐 Fortran Expect.f90 — 保留 -2M∫F²dr 质量残项
+    #   Fortran L264: +amu/hbc*(G²-F²), L267: -amu*xn
+    #   净效果 ≠ 0! 而是 = -2M∫F²dr ≈ -9.4 MeV (对典型核态)
+    #   推导: M∫(G²-F²)dr - M·1 = M∫(G²-F²-G²-F²)dr = -2M∫F²dr
+    M_hc = 939.0 / hbc
     h_psi_g_binding = hbc * (-df_full + (kappa_exp_full / r_safe + vtt + YF) * f + (vps + YG) * g)
-    h_psi_f_binding = hbc * ( dg_full + (kappa_exp_full / r_safe + vtt + XG) * g + (vms + XF) * f)
+    h_psi_f_binding = hbc * ( dg_full + (kappa_exp_full / r_safe + vtt + XG) * g + (vms + XF - 2.0 * M_hc) * f)
 
     # Rayleigh商分子: <ψ|h_RHF|ψ> 【单位: MeV】
     rayleigh_numerator = torch.sum((g * h_psi_g_binding + f * h_psi_f_binding) * dr, dim=1)
@@ -1027,12 +1032,11 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     E_hc = E / hbc
     r1 = kappa_exp / r
 
-    # ★ v12: M_hc不再用于Rayleigh商（v11错误添加，已撤销）
-    #   保留M_hc定义以备其他用途（如物理态约束中的动能正定性检查）
+    # ★ v15: M_hc用于PDE耦合系数(+2M)和Rayleigh商(-2M∫F²dr)
     M_hc = 939.0 / hbc  # 核子静止质量 / ħc ≈ 4.76 fm⁻¹
 
     u1g = r1 + vtt + XG
-    u1f = E_hc - vms - XF
+    u1f = E_hc + 2.0 * M_hc - vms - XF   # ★ v15: +2M修正（vms未含2M偏移）
     u2f = r1 + vtt + YF
     u2g = E_hc - vps - YG
 
@@ -1198,11 +1202,10 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     r_safe = r.clone()
     r_safe[r_safe < 1e-10] = 1e-10
 
-    # ★ v12: 撤销v11的M_hc质量项 — 同calc_physics_residual
-    #   Fortran Expect.f267: ekt1 -= amu*xn 抵消了L264的M项
-    #   单粒子净M贡献 ≈ 0，不应显式添加
+    # ★ v15: 严格对齐 Expect.f90 — 保留 -2M∫F²dr 质量残项
+    #   同 calc_physics_residual 的推导: Fortran净效果 = -2M∫F²dr ≈ -9.4 MeV
     h_psi_g_binding = hbc * (-df_full + (kappa_exp / r_safe + vtt + YF) * f + (vps + YG) * g)
-    h_psi_f_binding = hbc * (dg_full + (kappa_exp / r_safe + vtt + XG) * g + (vms + XF) * f)
+    h_psi_f_binding = hbc * (dg_full + (kappa_exp / r_safe + vtt + XG) * g + (vms + XF - 2.0 * M_hc) * f)
 
     rayleigh_numerator = torch.sum((g * h_psi_g_binding + f * h_psi_f_binding) * dr, dim=1)
     rayleigh_denominator = torch.sum((g**2 + f**2) * dr, dim=1)
@@ -1322,11 +1325,10 @@ class RHFConsistencyChecker:
         dg_full = dg_dr
         df_full = df_dr
 
-        # ★ v10 严格自洽 RHF Rayleigh 商（含完整交换项和张量项）
-        r_safe = r.clone()
-        r_safe[r_safe < 1e-10] = 1e-10
+        # ★ v15: 严格对齐 Expect.f90 — 保留 -2M∫F²dr 质量残项
+        M_hc = 939.0 / hbc
         h_psi_g_binding = hbc * (-df_full + (kappa_exp / r_safe + vtt + YF) * f + (vps + YG) * g)
-        h_psi_f_binding = hbc * (dg_full + (kappa_exp / r_safe + vtt + XG) * g + (vms + XF) * f)
+        h_psi_f_binding = hbc * (dg_full + (kappa_exp / r_safe + vtt + XG) * g + (vms + XF - 2.0 * M_hc) * f)
         rayleigh_num = torch.sum((g * h_psi_g_binding + f * h_psi_f_binding) * dr, dim=1)
         rayleigh_den = torch.sum((g**2 + f**2) * dr, dim=1)
         E_rayleigh = rayleigh_num / (rayleigh_den.clamp(min=1e-10))  # 结合能 [MeV]（无需减M）
