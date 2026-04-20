@@ -348,10 +348,12 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     r_safe[r_safe < 1e-10] = 1e-10
     kappa_exp_full = kappa.unsqueeze(1)
 
-    # ★ v11: 严格匹配 Fortran Expect.f262-264 动能验证公式（含质量项）
-    M_hc = 939.0 / hbc  # 核子静止质量 / ħc ≈ 4.76 fm⁻¹
-    h_psi_g_binding = hbc * (-df_full + (kappa_exp_full / r_safe + vtt + YF) * f + (vps + YG) * g + M_hc * g)
-    h_psi_f_binding = hbc * ( dg_full + (kappa_exp_full / r_safe + vtt + XG) * g + (vms + XF) * f - M_hc * f)
+    # ★ v12: 撤销v11的M_hc质量项（错误添加）
+    #   Fortran Expect.f262-264 加了 amu/hbc*(G²-F²), 但L267立即减去amu*xn
+    #   对于单粒子(xn≈1,<G²>≈1): M净贡献 ≈ amu*1 - amu*1 ≈ 0
+    #   原v11只加了M没减 → E_rayleigh偏移+931MeV → 震荡根因!
+    h_psi_g_binding = hbc * (-df_full + (kappa_exp_full / r_safe + vtt + YF) * f + (vps + YG) * g)
+    h_psi_f_binding = hbc * ( dg_full + (kappa_exp_full / r_safe + vtt + XG) * g + (vms + XF) * f)
 
     # Rayleigh商分子: <ψ|h_RHF|ψ> 【单位: MeV】
     rayleigh_numerator = torch.sum((g * h_psi_g_binding + f * h_psi_f_binding) * dr, dim=1)
@@ -1025,8 +1027,8 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     E_hc = E / hbc
     r1 = kappa_exp / r
 
-    # ★ v11: 严格匹配 Fortran Expect.f262-264 动能验证公式（含质量项）
-    # ★ v7: 2Mc² 非对称耦合项 → 现用于 Rayleigh 商质量项
+    # ★ v12: M_hc不再用于Rayleigh商（v11错误添加，已撤销）
+    #   保留M_hc定义以备其他用途（如物理态约束中的动能正定性检查）
     M_hc = 939.0 / hbc  # 核子静止质量 / ħc ≈ 4.76 fm⁻¹
 
     u1g = r1 + vtt + XG
@@ -1190,9 +1192,11 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     r_safe = r.clone()
     r_safe[r_safe < 1e-10] = 1e-10
 
-    # ★ v11: 严格匹配 Fortran Expect.f262-264 动能验证公式（含质量项）
-    h_psi_g_binding = hbc * (-df_full + (kappa_exp / r_safe + vtt + YF) * f + (vps + YG) * g + M_hc * g)
-    h_psi_f_binding = hbc * (dg_full + (kappa_exp / r_safe + vtt + XG) * g + (vms + XF) * f - M_hc * f)
+    # ★ v12: 撤销v11的M_hc质量项 — 同calc_physics_residual
+    #   Fortran Expect.f267: ekt1 -= amu*xn 抵消了L264的M项
+    #   单粒子净M贡献 ≈ 0，不应显式添加
+    h_psi_g_binding = hbc * (-df_full + (kappa_exp / r_safe + vtt + YF) * f + (vps + YG) * g)
+    h_psi_f_binding = hbc * (dg_full + (kappa_exp / r_safe + vtt + XG) * g + (vms + XF) * f)
 
     rayleigh_numerator = torch.sum((g * h_psi_g_binding + f * h_psi_f_binding) * dr, dim=1)
     rayleigh_denominator = torch.sum((g**2 + f**2) * dr, dim=1)
