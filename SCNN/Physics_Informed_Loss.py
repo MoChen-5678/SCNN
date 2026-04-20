@@ -361,11 +361,9 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     # 网络输出的能量（专用标量能量头）
     energy_network_scalar = E.squeeze(-1)  # (B,) — 结合能 [MeV]
     
-    # ★ v9 梯度阻断 (Master-Slave Locking):
-    #   能量读数器 loss：让网络标量输出逼近当前波函数的真实 RHF 能量
-    #   detach() 阻止能量误差的梯度回传到波函数
-    #   现在 h_ψ 已包含完整交换项，detach() 提供的是精确靶标
-    loss_energy_rayleigh = torch.mean((energy_network_scalar - energy_rayleigh.detach()) ** 2)
+    # ★ v10 恢复双向梯度流：取消 detach() 梯度阻断
+    #   能量与波函数同时优化，让 Rayleigh 商自然驱动两者收敛到自洽解
+    loss_energy_rayleigh = torch.mean((energy_network_scalar - energy_rayleigh) ** 2)
 
     # 同时保存Rayleigh能量供后续使用
     energy_E = energy_rayleigh.detach()  # (B,)
@@ -1199,8 +1197,8 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     energy_rayleigh = rayleigh_numerator / (rayleigh_denominator.clamp(min=1e-10))  # 结合能 [MeV]
 
     energy_network_scalar = E.squeeze(-1)  # 网络输出的结合能 [MeV]
-    # ★ v9 梯度阻断 + v10 完整RHF算符
-    loss_energy_rayleigh = torch.mean((energy_network_scalar - energy_rayleigh.detach()) ** 2)
+    # ★ v10 恢复双向梯度流：取消 detach() 梯度阻断
+    loss_energy_rayleigh = torch.mean((energy_network_scalar - energy_rayleigh) ** 2)
 
     # ═══════ 诊断信息 ═══════
     vps_core = vps[:, :min(int(6.0/dr), npt)].detach().mean()
