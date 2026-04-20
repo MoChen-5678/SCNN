@@ -138,14 +138,13 @@ def _build_fd_matrix_5padf(n: int, dr: float, direction: str = 'forward',
         # ─── BACKWARD 模式：左边界后向，右边界前向（用于 F 小分量）──
         # 与 forward 镜像对称，保证 G-F 交替时 Dirac 哈密顿量的厄米性
 
-        # 左边界 i=0: 5PADF 后向（镜像 Eq.(14), 但左侧只能用前向点信息）
-        # ★ 注意：在最左端物理上无法真正做后向差分，
-        #   此处仍用前向模板但标记为 backward 以区分语义
-        D[0, 0] = (-25.0) * inv_12dr
-        D[0, 1] = (+48.0) * inv_12dr
-        D[0, 2] = (-36.0) * inv_12dr
-        D[0, 3] = (+16.0) * inv_12dr
-        D[0, 4] = (-3.0)  * inv_12dr
+        # 左边界 i=0: 5PADF 后向（镜像 Eq.(14), 符号与forward相反）
+        # ★ v11修正: 符号翻转保证 D_backward ≈ -D_forward（厄米性）
+        D[0, 0] = (+25.0) * inv_12dr
+        D[0, 1] = (-48.0) * inv_12dr
+        D[0, 2] = (+36.0) * inv_12dr
+        D[0, 3] = (-16.0) * inv_12dr   # v11: 修复 inc_12dr → inv_12dr 笔误
+        D[0, 4] = (+3.0)  * inv_12dr
 
         # 次左边界 i=1: 4PADF 后向
         D[1, 0] = (-3.0/2.0) / dr
@@ -157,7 +156,8 @@ def _build_fd_matrix_5padf(n: int, dr: float, direction: str = 'forward',
         D[n-2, n-2] = (-4.0/2.0) / dr
         D[n-2, n-1] = (+3.0/2.0) / dr
 
-        # 右边界 i=n-1: 5PADF 前向（镜像 Eq.(13)）
+        # 右边界 i=n-1: 5PADF 前向（镜像 Eq.(13), 符号与forward相反）
+        # ★ v11修正: forward右边界用Eq.(14)=+25/-48..., backward右边界用Eq.(13)=-25/+48...
         D[n-1, n-5] = (-25.0) * inv_12dr
         D[n-1, n-4] = (+48.0) * inv_12dr
         D[n-1, n-3] = (-36.0) * inv_12dr
@@ -348,9 +348,10 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     r_safe[r_safe < 1e-10] = 1e-10
     kappa_exp_full = kappa.unsqueeze(1)
 
-    # ★ 严格匹配 PDE 的完整 RHF 算符（含 vtt, X, Y 交换/张量项）
-    h_psi_g_binding = hbc * (-df_full + (kappa_exp_full / r_safe + vtt + YF) * f + (vps + YG) * g)
-    h_psi_f_binding = hbc * (dg_full + (kappa_exp_full / r_safe + vtt + XG) * g + (vms + XF) * f)
+    # ★ v11: 严格匹配 Fortran Expect.f262-264 动能验证公式（含质量项）
+    M_hc = 939.0 / hbc  # 核子静止质量 / ħc ≈ 4.76 fm⁻¹
+    h_psi_g_binding = hbc * (-df_full + (kappa_exp_full / r_safe + vtt + YF) * f + (vps + YG) * g + M_hc * g)
+    h_psi_f_binding = hbc * ( dg_full + (kappa_exp_full / r_safe + vtt + XG) * g + (vms + XF) * f - M_hc * f)
 
     # Rayleigh商分子: <ψ|h_RHF|ψ> 【单位: MeV】
     rayleigh_numerator = torch.sum((g * h_psi_g_binding + f * h_psi_f_binding) * dr, dim=1)
@@ -1024,8 +1025,9 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     E_hc = E / hbc
     r1 = kappa_exp / r
 
-    # ★ v7: 2Mc² 非对称耦合项（同 calc_physics_residual）
-    M_hc = 939.0 / hbc
+    # ★ v11: 严格匹配 Fortran Expect.f262-264 动能验证公式（含质量项）
+    # ★ v7: 2Mc² 非对称耦合项 → 现用于 Rayleigh 商质量项
+    M_hc = 939.0 / hbc  # 核子静止质量 / ħc ≈ 4.76 fm⁻¹
 
     u1g = r1 + vtt + XG
     u1f = E_hc - vms - XF
@@ -1188,9 +1190,9 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     r_safe = r.clone()
     r_safe[r_safe < 1e-10] = 1e-10
 
-    # ★ 严格匹配 PDE 的完整 RHF 算符
-    h_psi_g_binding = hbc * (-df_full + (kappa_exp / r_safe + vtt + YF) * f + (vps + YG) * g)
-    h_psi_f_binding = hbc * (dg_full + (kappa_exp / r_safe + vtt + XG) * g + (vms + XF) * f)
+    # ★ v11: 严格匹配 Fortran Expect.f262-264 动能验证公式（含质量项）
+    h_psi_g_binding = hbc * (-df_full + (kappa_exp / r_safe + vtt + YF) * f + (vps + YG) * g + M_hc * g)
+    h_psi_f_binding = hbc * (dg_full + (kappa_exp / r_safe + vtt + XG) * g + (vms + XF) * f - M_hc * f)
 
     rayleigh_numerator = torch.sum((g * h_psi_g_binding + f * h_psi_f_binding) * dr, dim=1)
     rayleigh_denominator = torch.sum((g**2 + f**2) * dr, dim=1)
