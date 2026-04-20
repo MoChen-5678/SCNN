@@ -647,22 +647,21 @@ class RHF_FNO_GRU(nn.Module):
         # 正确顺序：
         #   新顺序：raw → Sobolev平滑(消除高频噪声) → ansatz_mask(r^{l+1}·e^{-αr})
         #   物理依据：平滑操作是线性算子，与幂律掩码可交换(理想情况)
-        # ===== ★ Sobolev 平滑正则化（消除锯齿）=====
-        #   v7: 撤销 v6 的 *0.05 暴力缩放
-        #   物理方程已修正（2Mc² 非对称耦合），网络会自然学到 F 的正确尺度
+        # ===== ★ Sobolev 平滑正则化 + v6相对论预缩放 =====
         gf_raw = torch.stack([raw_g, raw_f], dim=1)  # (B, 2, N)
         gf_smoothed = self.sobolev_smooth(gf_raw)
 
         raw_g = gf_smoothed[:, 0, :]
-
-        # ★ v15: 移除0.05暴力缩放 — 物理方程已自洽，网络会自然学到F/G≈v/c
-        raw_f = gf_smoothed[:, 1, :]
+        # ★ v6 相对论自然尺度预缩放：F 物理量级 ≈ 0.05 × G (v/c ~ 5%)
+        # 网络只需输出 O(1) 的平缓信号，改善 F 梯度流，防止 F→0 坍缩
+        raw_f = gf_smoothed[:, 1, :] * 0.05
 
         # 预测衰减系数（控制远场指数衰减）
         alpha_g_raw = self.alpha_net(enhanced_hidden)
         alpha_g = (0.1 + 2.9 * torch.sigmoid(alpha_g_raw)).squeeze(-1)
 
-        # G 和 F 共用相同衰减指数（自由 Dirac 方程渐近行为）
+        # ★ v6: G 和 F 必须拥有完全相同的衰减指数！
+        # r→∞ 时自由 Dirac 方程: G,F ∝ exp(-αr)，区别仅在常数系数
         alpha_f = alpha_g
 
         alpha_g = alpha_g.unsqueeze(1)

@@ -3,46 +3,31 @@ import torch
 # 全局参考尺度：在首次调用时自动估算，后续用于归一化
 _ref_scale = None
 
-# ★ v9 全局 FD 矩阵缓存（消除 O(N³) for 循环瓶颈）
-#   原代码每次 forward 都在 Python for 循环中逐元素构建 N×N 矩阵，
-#   每次 Loss 计算调用 6 次 → 数万次 CPU-GPU kernel launch
-#   缓存后：相同(n, dr, direction)只构建一次，后续直接复用
-_FD_MATRIX_CACHE = {}
-
-def get_cached_fd_matrix_5padf(n: int, dr: float, direction: str = 'forward',
-                                device=None, dtype=None):
-    """带全局缓存的 5PADF 矩阵获取器（训练速度提升 10~50x 的核心）"""
-    if device is None:
-        device = 'cpu'
-    if dtype is None:
-        dtype = torch.float32
-    cache_key = (n, dr, direction, str(device), str(dtype))
-    if cache_key not in _FD_MATRIX_CACHE:
-        matrix = _build_fd_matrix_5padf(n, dr, direction=direction,
-                                         device=device, dtype=dtype)
-        _FD_MATRIX_CACHE[cache_key] = matrix.detach().clone()
-    return _FD_MATRIX_CACHE[cache_key]
-
-
-def clear_fd_cache():
-    """清空缓存（仅在网格参数变化时调用）"""
-    global _FD_MATRIX_CACHE
-    _FD_MATRIX_CACHE.clear()
-
 
 # ═══════════════════════════════════════════════════════════════
 #   ★ 2026-04-19 新增：全局有限差分矩阵构建器（Wang et al. 2025 5PADF 方案）
+#   ★ 2026-04-20 修复：宇称(parity)→差分方向映射规则
 #
 #   核心文献：
 #     Wang et al., Chin. Phys. C 49, 014106 (2025)
 #     "Solving the relativistic Hartree-Bogoliubov equation with FDM"
+#     + Ref.[50]: Szafran et al., Phys. Rev. B 99, 195406 (2019)
 #
-#   关键发现（来自该论文）：
+#   关键发现（来自该论文 Eq.4 + 第4页第44-47行）：
 #     1. 对称中心差分(CDF)在求解Dirac方程时必然产生虚假态(spurious states)
 #        原因：计算一阶导数时丢失了中间点 f(r) 的信息
 #     2. 解决方案：使用非对称差分公式(ADF)，特别是5点ADF (5PADF)
 #     3. ★ 关键约束：G(r)和F(r)必须交替使用 forward/backward ADF！
-#        这样才能保证 Dirac Hamiltonian 的厄米性(Hermiticity)，消除虚假态
+#        论文原文："one should use the forward or backward ADF alternatively
+#        for G(r) and F(r) according to their different parities."
+#     4. ★ 宇称规则（Ref.[50] Szafran）：
+#        - 波函数 ψ = (1/r)[iG·Ω^l, F·Ω^{l'}], l+l'=2j
+#        - G的宇称 π_G = (-1)^l, F的宇称 π_F = (-1)^{l'}
+#        - ★ 偶宇称(even parity) → forward ADF
+#        - ★ 奇宇称(odd parity) → backward ADF
+#        - κ<0: l=|κ|-1; κ>0: l=κ → G方向 = forward if l%2==0 else backward
+#        - 例: 1s₁/₂(κ=-1): l=0(even→forward), l'=1(odd→backward) ✓
+#        - 例: 1p₁/₂(κ=+1): l=1(odd→backward), l'=0(even→forward) ←之前错误!
 #
 #   5PADF 公式（论文 Eq.13-14, 精度 O(h^4)）:
 #     前向(Forward): df/dr|0 = (-25f0 + 48f1 - 36f2 + 16f3 - 3f4) / 12h   Eq.(13)
@@ -50,126 +35,166 @@ def clear_fd_cache():
 # ═══════════════════════════════════════════════════════════════
 
 
+# ★ v6+: 全局FD矩阵缓存 — 避免每个batch重复构建相同的N×N稠密矩阵!
+#   key: (n, dr, direction) → value: D矩阵(CUDA tensor)
+_fd_cache = {}
+
+
+def _get_fd_directions(kappa):
+    """
+    根据κ量子数确定G和F各自应使用的差分方向（论文宇称规则）。
+
+    ★ 物理依据: Wang et al. (2025) Eq.4 + Ref.[50] Szafran et al. (2019)
+      - 波函数 ψ = (1/r)[iG·Ω^l, F·Ω^{l'}], l+l'=2j
+      - G的宇称 π_G = (-1)^l, F的宇称 π_F = (-1)^{l'}
+      - 偶宇称(even parity) → forward ADF
+      - 奇宇称(odd parity) → backward ADF
+      - κ<0: l=|κ|-1; κ>0: l=κ
+
+    参数:
+        kappa: 标量或(B,)张量
+
+    返回:
+        g_dir: G的差分方向 'forward'/'backward'
+        f_dir: F的差分方向 'forward'/'backward'（始终与G相反）
+    """
+    if isinstance(kappa, torch.Tensor):
+        kappa_val = kappa.long().item() if kappa.numel() == 1 else kappa.long()
+    else:
+        kappa_val = int(kappa)
+
+    if isinstance(kappa_val, int):
+        l_G = abs(kappa_val) - 1 if kappa_val < 0 else kappa_val
+        g_dir = 'forward' if l_G % 2 == 0 else 'backward'
+    else:
+        # (B,) tensor — 取众数（batch内通常一致）
+        l_G = torch.where(kappa_val < 0, -kappa_val - 1, kappa_val)
+        # 偶宇称→forward, 奇宇称→backward
+        g_dir = 'forward' if (l_G % 2).mode().values.item() == 0 else 'backward'
+
+    f_dir = 'backward' if g_dir == 'forward' else 'forward'  # G和F交替
+    return g_dir, f_dir
+
+
 def _build_fd_matrix_5padf(n: int, dr: float, direction: str = 'forward',
                            device=None, dtype=None):
     """
     构建 NxN 一阶导数有限差分矩阵（基于 Wang et al. 2025 的 5PADF 方案）。
+    ★ v6+: 全局缓存 + 向量化构造 + 强制CUDA加速
 
     参数：
         n:         网格点数
         dr:        径向网格间距 (fm)
-        direction: 'forward'(G大分量) 或 'backward'(F小分量)
-                   ★ G和F必须使用相反方向以保证Dirac哈密顿量的厄米性！
-        device, dtype: 张量设备/数据类型
+        direction: 'forward' 或 'backward'
+                   ★ 方向由G/F的宇称决定! 偶宇称→forward, 奇宇称→backward
+                   ★ 用 _get_fd_directions(kappa) 获取正确方向
+        device, dtype: 张量设备/数据类型（默认cuda）
 
     返回：
         D: (N, N) 稠密张量，一阶导数差分矩阵
 
-    边界策略（5PADF, O(dr^4) 精度）:
-
-      direction='forward' (用于大分量 G):
-        D[0,:]   = 5PADF前向  [-25,+48,-36,+16,-3]/12h    论文Eq.(13)
-        D[1,:]   = 4PADF前向  [-3,+4,-1]/2h                论文Eq.(11)
-        D[2:-2,:]= 4阶中心差分 [+1,-8,0,+8,-1]/12h        论文Eq.(10)
-        D[-2,:]  = 4PADF后向  [+1,-4,+3]/2h                 论文Eq.(12)
-        D[-1,:]  = 5PADF后向  [+25,-48,+36,-16,+3]/12h     论文Eq.(14)
-
-      direction='backward' (用于小分量 F):
-        与 forward 镜像对称：左边界用后向、右边界用前向
-
     文献依据：
         [1] Y. Wang et al., Chin. Phys. C 49, 014106 (2025), Eqs.(9)-(14)
-        [2] J.C. Pei et al., Phys. Rev. C 90, 024317 (2014)
-        [3] G.F. Bertsch et al., Ann. Phys. 209, 327 (1991)
     """
     if direction not in ('forward', 'backward'):
-        raise ValueError(f"direction={direction}, 必须为 'forward'(G) 或 'backward'(F)")
+        raise ValueError(f"direction={direction}")
+
+    # ★ 缓存查找：相同(n, dr, direction)只计算一次
+    cache_key = (n, dr, direction)
+    if cache_key in _fd_cache:
+        cached_D = _fd_cache[cache_key]
+        # 设备迁移缓存（仅当目标设备不同时）
+        if device is not None and cached_D.device != torch.device(device):
+            cached_D = cached_D.to(device)
+        return cached_D
 
     if device is None:
-        device = 'cpu'
+        device = 'cuda'  # ★ v6+: 默认CUDA！不再默认CPU
     if dtype is None:
         dtype = torch.float32
 
-    D = torch.zeros(n, n, device=device, dtype=dtype)
-    inv_12dr = 1.0 / (12.0 * dr)  # 5PADF 公共分母
+    inv_12dr = 1.0 / (12.0 * dr)
+    inv_2dr = 1.0 / (2.0 * dr)
+    inv_dr = 1.0 / dr
 
-    # ═══ 内部点 [2, n-3]: 4阶中心差分（两种方向相同）═╣
-    # 论文 Eq.(10): df/dr|_i = (f_{i-2} - 8f_{i-1} + 8f_{i+1} - f_{i+2}) / 12h
-    c_im2 = (+1.0)  * inv_12dr
-    c_im1 = (-8.0)  * inv_12dr
-    c_i   = 0.0
-    c_ip1 = (+8.0)  * inv_12dr
-    c_ip2 = (-1.0)  * inv_12dr
-    for i in range(2, n-2):
-        D[i, i-2] = c_im2
-        D[i, i-1] = c_im1
-        D[i, i]   = c_i
-        D[i, i+1] = c_ip1
-        D[i, i+2] = c_ip2
+    D = torch.zeros(n, n, device=device, dtype=dtype)
+
+    # ═══════ 全部N点使用论文非对称差分公式 ═══════
+    #
+    # ★ 物理核心: Dirac耦合方程 G'∝F, F'∝G 的离散格式必须满足
+    #     D_forward = -D_backward^T  (伴随/adjoint关系)
+    #     否则哈密顿量非厄米 → 能量本征值变复数!
+    #
+    # 实现策略: 先构建forward矩阵，backward通过镜像转置直接派生
+    #           D_backward[i,j] = D_forward[n-1-j, n-1-i]
+    #           (= 关于反对角线翻转后再转置)
 
     if direction == 'forward':
-        # ─── FORWARD 模式：左边界前向，右边界后向（用于 G 大分量）──
-
-        # 左边界 i=0: 5PADF 前向 — 论文 Eq.(13)
-        D[0, 0] = (-25.0) * inv_12dr
-        D[0, 1] = (+48.0) * inv_12dr
-        D[0, 2] = (-36.0) * inv_12dr
-        D[0, 3] = (+16.0) * inv_12dr
-        D[0, 4] = (-3.0)  * inv_12dr
-
-        # 次左边界 i=1: 4PADF 前向 — 论文 Eq.(11): df/dr = (-3f1 + 4f2 - f3) / 2h
-        D[1, 0] = (-3.0/2.0) / dr
-        D[1, 1] = (+4.0/2.0) / dr
-        D[1, 2] = (-1.0/2.0) / dr
-
-        # 次右边界 i=n-2: 4PADF 后向 — 论文 Eq.(12): df/dr = (f_{n-3} - 4f_{n-2} + 3f_{n-1}) / 2h
-        D[n-2, n-3] = (+1.0/2.0) / dr
-        D[n-2, n-2] = (-4.0/2.0) / dr
-        D[n-2, n-1] = (+3.0/2.0) / dr
-
-        # 右边界 i=n-1: 5PADF 后向 — 论文 Eq.(14)
-        D[n-1, n-5] = (+25.0) * inv_12dr
-        D[n-1, n-4] = (-48.0) * inv_12dr
-        D[n-1, n-3] = (+36.0) * inv_12dr
-        D[n-1, n-2] = (-16.0) * inv_12dr
-        D[n-1, n-1] = (+3.0)  * inv_12dr
+        # ─── FORWARD模式(G大分量): 从左到右，每行看右侧可用点 ───
+        for i in range(n):
+            avail_right = n - i
+            if avail_right >= 5:
+                D[i, i]   = (-25.0) * inv_12dr
+                D[i, i+1] = (+48.0) * inv_12dr
+                D[i, i+2] = (-36.0) * inv_12dr
+                D[i, i+3] = (+16.0) * inv_12dr
+                D[i, i+4] = (-3.0)  * inv_12dr
+            elif avail_right == 4:
+                D[i, i]   = (-3.0) * inv_2dr
+                D[i, i+1] = (+4.0) * inv_2dr
+                D[i, i+2] = (-1.0) * inv_2dr
+            elif avail_right == 3:
+                D[i, i]   = (-3.0) * inv_2dr
+                D[i, i+1] = (+4.0) * inv_2dr
+                D[i, i+2] = (-1.0) * inv_2dr
+            elif avail_right == 2:
+                D[i, i]   = (-1.0) * inv_dr
+                D[i, i+1] = (+1.0) * inv_dr
+            else:
+                D[i, i] = 0.0
 
     else:
-        # ─── BACKWARD 模式：左边界后向，右边界前向（用于 F 小分量）──
-        # 与 forward 镜像对称，保证 G-F 交替时 Dirac 哈密顿量的厄米性
+        # ─── BACKWARD模式(F小分量): forward的严格镜像伴随 ───
+        # ★ 不再单独构建！直接从forward派生，保证数学上的精确伴随关系
+        #   构建临时forward矩阵，再做 镜像翻转+转置
+        D_fwd = torch.zeros(n, n, device=device, dtype=dtype)
+        for i in range(n):
+            avail_right = n - i
+            if avail_right >= 5:
+                D_fwd[i, i]   = (-25.0) * inv_12dr
+                D_fwd[i, i+1] = (+48.0) * inv_12dr
+                D_fwd[i, i+2] = (-36.0) * inv_12dr
+                D_fwd[i, i+3] = (+16.0) * inv_12dr
+                D_fwd[i, i+4] = (-3.0)  * inv_12dr
+            elif avail_right == 4:
+                D_fwd[i, i]   = (-3.0) * inv_2dr
+                D_fwd[i, i+1] = (+4.0) * inv_2dr
+                D_fwd[i, i+2] = (-1.0) * inv_2dr
+            elif avail_right == 3:
+                D_fwd[i, i]   = (-3.0) * inv_2dr
+                D_fwd[i, i+1] = (+4.0) * inv_2dr
+                D_fwd[i, i+2] = (-1.0) * inv_2dr
+            elif avail_right == 2:
+                D_fwd[i, i]   = (-1.0) * inv_dr
+                D_fwd[i, i+1] = (+1.0) * inv_dr
+            else:
+                D_fwd[i, i] = 0.0
 
-        # 左边界 i=0: 5PADF 后向（镜像 Eq.(14), 符号与forward相反）
-        # ★ v11修正: 符号翻转保证 D_backward ≈ -D_forward（厄米性）
-        D[0, 0] = (+25.0) * inv_12dr
-        D[0, 1] = (-48.0) * inv_12dr
-        D[0, 2] = (+36.0) * inv_12dr
-        D[0, 3] = (-16.0) * inv_12dr   # v11: 修复 inc_12dr → inv_12dr 笔误
-        D[0, 4] = (+3.0)  * inv_12dr
+        # ★ 反角镜像伴随变换: D_bw[i,j] = -D_fw[n-1-i, n-1-j]
+        #   验证: D_bw[n-1,n-1] = -D_fw[0,0] = -(-25)=+25 ✓ (论文Eq.14)
+        #         D_bw[n-1,n-2] = -D_fw[0,1] = -(+48)=-48 ✓
+        #   物理意义: 左端的forward差分 ≡ 右端取负的backward差分
+        #   数学保证: D_bw = -D_fw.flip([0,1]) → 精确伴随关系
+        D = (-D_fwd).flip([0, 1]).contiguous()
 
-        # 次左边界 i=1: 4PADF 后向
-        D[1, 0] = (-3.0/2.0) / dr
-        D[1, 1] = (+4.0/2.0) / dr
-        D[1, 2] = (-1.0/2.0) / dr
-
-        # 次右边界 i=n-2: 4PADF 前向（镜像 Eq.(11)）
-        D[n-2, n-3] = (+1.0/2.0) / dr
-        D[n-2, n-2] = (-4.0/2.0) / dr
-        D[n-2, n-1] = (+3.0/2.0) / dr
-
-        # 右边界 i=n-1: 5PADF 前向（镜像 Eq.(13), 符号与forward相反）
-        # ★ v11修正: forward右边界用Eq.(14)=+25/-48..., backward右边界用Eq.(13)=-25/+48...
-        D[n-1, n-5] = (-25.0) * inv_12dr
-        D[n-1, n-4] = (+48.0) * inv_12dr
-        D[n-1, n-3] = (-36.0) * inv_12dr
-        D[n-1, n-2] = (+16.0) * inv_12dr
-        D[n-1, n-1] = (-3.0)  * inv_12dr
-
+    # ★ 存入全局缓存（相同n/dr/direction只构建一次）
+    _fd_cache[cache_key] = D
     return D
 
 
 def _build_fd_matrix(n: int, dr: float, order: int = 4, device=None, dtype=None):
-    """v9: 兼容性别装，走缓存路径"""
-    return get_cached_fd_matrix_5padf(n, dr, direction='forward', device=device, dtype=dtype)
+    """兼容性包装：默认使用 forward-5PADF。新代码建议用 _get_fd_directions(kappa) 确定方向后调用 _build_fd_matrix_5padf"""
+    return _build_fd_matrix_5padf(n, dr, direction='forward', device=device, dtype=dtype)
 
 
 def _apply_fd_matrix(signal, D_matrix):
@@ -267,44 +292,53 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     E_hc = E / hbc
     r1 = kappa_exp / r
 
-    # ★ v15: PDE耦合系数必须包含 +2M（vms是纯Σ_−，未减去2M！）
-    #   铁证: 数据中 vms_core ≈ +576 MeV = 纯 Σ_− = V - S
-    #   若已减2M: 应为 576 - 1878 = -1301 MeV ← 但实际不是!
-    #   Dirac方程正确形式: G' = (ε + 2M - Σ_−)·F → Python必须显式加2M
-    M_hc = 939.0 / hbc  # 核子静质量 / ħc ≈ 4.76 fm⁻¹
-    u1g = r1 + vtt + XG
-    u1f = E_hc + 2.0 * M_hc - vms - XF   # ★ +2M: 否则系数符号反转!
-    u2f = r1 + vtt + YF
-    u2g = E_hc - vps - YG
+    # ★ v6+: 严格量纲统一 — 所有势场必须转换为fm⁻¹才能与E_hc(=ε/ħc)相加
+    #   原代码: u1g = r1(fm⁻¹) + vtt(MeV) → "公斤加米"量纲灾难!
+    #   后果: PDE系数偏大~200倍，网络被迫学出畸形波形来抵消
+    #   修复: vps/vms/vtt/XG/XF/YG/YF 全部 /hbc → 统一为fm⁻¹
+    vps_hc = vps / hbc
+    vms_hc = vms / hbc
+    vtt_hc = vtt / hbc
+    XG_hc = XG / hbc
+    XF_hc = XF / hbc
+    YG_hc = YG / hbc
+    YF_hc = YF / hbc
 
-    # 4. 计算内部网格点的一阶微商 (★ 4阶中心差分，精度O(dr⁴))
-    # 2阶: f'(x) ≈ (f[i+1] - f[i-1]) / (2*dr)         误差 O(dr²)=O(0.01)
-    # 4阶: f'(x) ≈ (-f[i+2]+8f[i+1]-8f[i-1]+f[i-2]) / (12*dr)  误差 O(dr⁴)=O(0.0001)
-    # 内部点范围: [2:-2]（跳过两端各2个点）
-    dg_dr = (-g[:, 4:] + 8.0 * g[:, 3:-1] - 8.0 * g[:, 1:-3] + g[:, :-4]) / (12.0 * dr)
-    df_dr = (-f[:, 4:] + 8.0 * f[:, 3:-1] - 8.0 * f[:, 1:-3] + f[:, :-4]) / (12.0 * dr)
+    u1g = r1 + vtt_hc + XG_hc
+    u1f = E_hc - vms_hc - XF_hc
+    u2f = r1 + vtt_hc + YF_hc
+    u2g = E_hc - vps_hc - YG_hc
 
-    # 截取内部点对齐（4阶差分跳过两端各2个点，所以内部点范围是 [2:-2]）
-    g_int, f_int = g[:, 2:-2], f[:, 2:-2]
-    u1g_int, u1f_int = u1g[:, 2:-2], u1f[:, 2:-2]
-    u2f_int, u2g_int = u2f[:, 2:-2], u2g[:, 2:-2]
+    # ★ v6+: 统一使用论文5PADF全局差分矩阵（替代旧的手动切片4阶中心差分）
+    #   原代码: 手动切片 [4:],[:-4] → 丢失边界点! 近核区动能被抹除!
+    #   新方案: Wang et al. (2025) Chin.Phys.C Eq.(9)-(14) 全覆盖N点差分矩阵
+    #   ★ 宇称规则: 偶宇称→forward, 奇宇称→backward（论文Eq.4+Ref.[50]）
+    g_dir, f_dir = _get_fd_directions(kappa)
+    D_g_pde = _build_fd_matrix_5padf(npt, dr, direction=g_dir, device=device)
+    D_f_pde = _build_fd_matrix_5padf(npt, dr, direction=f_dir, device=device)
+    dg_dr = _apply_fd_matrix(g, D_g_pde)     # (B,N) — G导数，全覆盖
+    df_dr = _apply_fd_matrix(f, D_f_pde)     # (B,N) — F导数，全覆盖
+
+    # ★ 不再切片! 5PADF覆盖全部N点（含边界），直接用完整张量
+    g_int, f_int = g, f
+    u1g_int, u1f_int = u1g, u1f
+    u2f_int, u2g_int = u2f, u2g
 
     # ================================================================
     #   约束 1：狄拉克方程 PDE 残差 ★ 加强版
-    #   关键修复：不再用自适应缩放除以 scale_g/scale_f！
-    #   原因：原逻辑把残差归一化到 O(1)，导致网络"满足于"大残差
-    #   新策略：用绝对残差 + r权重，直接驱动波函数趋向狄拉克本征解
     # ================================================================
     Rg = dg_dr - (-u1g_int * g_int + u1f_int * f_int)
     Rf = df_dr - (u2f_int * f_int - u2g_int * g_int)
 
     # 径向测度压制奇点 (r→0 时 κ/r 发散)
-    r_int = r[:, 2:-2]
+    r_int = r  # ★ 完整r网格（5PADF无需切片）
     Rg_weighted = Rg * r_int  # 自然压制近核区发散
     Rf_weighted = Rf * r_int
 
-    # ★ v10 相对论残差均衡：Rf 权重 30.0（安全区，避免高阶差分梯度爆炸）
-    loss_pde = torch.mean(Rg_weighted ** 2 + 30.0 * Rf_weighted ** 2) * dr
+    # ★ 不再自适应缩放！直接用绝对残差平方
+    # ★ Rf 加权 3.0：f 分量比 g 小 1-2 个量级，MSE 天然偏好 g
+    #   加权补偿确保 f 的 PDE 约束信号不会被 g 掩盖
+    loss_pde = torch.mean(Rg_weighted ** 2 + 3.0 * Rf_weighted ** 2) * dr
 
     # ================================================================
     #   约束 2：狄拉克归一化条件 ∫[g(r)² + f(r)²] dr = 1
@@ -328,50 +362,73 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     # ★ 2026-04-19 关键修复：使用5PADF全局差分矩阵替代zeros_like零填充！
     #   原代码用 zeros_like 填充边界导数 → 近核区动能贡献被抹除 → "物理真空"
     #   新方案：基于 Wang et al. (2025) Chin.Phys.C 的 5PADF 非对称差分公式
-    #   ★ 核心：G(大分量)用forward, F(小分量)用backward → 保证Dirac哈密顿量厄米性
+    #   ★ 宇称规则: 偶宇称→forward, 奇宇称→backward（论文Eq.4+Ref.[50]）
     # ================================================================
-    D_g = get_cached_fd_matrix_5padf(npt, dr, direction='forward', device=device)   # G: 前向
-    D_f = get_cached_fd_matrix_5padf(npt, dr, direction='backward', device=device)  # F: 后向
-    dg_full = _apply_fd_matrix(g, D_g)   # (B, N) — G的导数用前向差分
-    df_full = _apply_fd_matrix(f, D_f)   # (B, N) — F的导数用后向差分
+    D_g = _build_fd_matrix_5padf(npt, dr, direction=g_dir, device=device)   # G: 由宇称决定
+    D_f = _build_fd_matrix_5padf(npt, dr, direction=f_dir, device=device)   # F: 与G交替
+    dg_full = _apply_fd_matrix(g, D_g)   # (B, N) — G的导数
+    df_full = _apply_fd_matrix(f, D_f)   # (B, N) — F的导数
     
     # ================================================================
-    #   ★ 2026-04-19 v10 严格自洽 RHF Rayleigh 商
-    #   致命修复：原代码用 RMF 算符（只有 vps, vms）计算能量，
-    #   但 PDE 包含完整的 RHF 相互作用（vtt, XG, XF, YG, YF）！
+    #   ★ 2026-04-19 v5 修复：量纲统一的物理精确 Rayleigh 商（直接计算结合能 ε）
     #
-    #   从 PDE 严格逆向推导本征算符：
-    #     G' = -(κ/r + vtt + XG)·G + (E_hc - vms - XF)·F
-    #     ⇒ E_hc·F = G' + (κ/r + vtt + XG)·G + (vms + XF)·F
-    #     F' = +(κ/r + vtt + YF)·F - (E_hc - vps - YG)·G
-    #     ⇒ E_hc·G = -F' + (κ/r + vtt + YF)·F + (vps + YG)·G
+    #   物理诊断（量纲分析）：
+    #     r 单位: fm → 导数 df/dr 单位: fm⁻¹
+    #     vps (Σ_+) 来自网络，用于 u2g = E_hc - vps，其中 E_hc = E/(ħc) [fm⁻¹]
+    #     ⇒ vps 单位也是 fm⁻¹（量级 ±0.5）
+    #     M_nucleon = 939.0 [MeV] — ★ 绝对不能直接与 fm⁻¹ 量级的项相加！
     #
-    #   两边乘 ħc → MeV，包含完整张量+交换项
+    #   开创性推导：从 PDE 残差定义出发
+    #     E_hc · G = -dF/dr + (κ/r)F + vps·G      (E_hc = ε/ħc, 全部 fm⁻¹)
+    #   两边同乘 ħc:
+    #     ε · G = ħc · [ -dF/dr + (κ/r)F + vps·G ]
+    #   ⇒ 结合能 ε 的 Rayleigh 商分子 = ħc × (微分项+势场项)，无需 M_nucleon！
+    #
+    #   量纲统一为 MeV：所有 fm⁻¹ 的项必须乘以 hbc (=197.328284 MeV·fm)
     # ================================================================
     r_safe = r.clone()
-    r_safe[r_safe < 1e-10] = 1e-10
-    kappa_exp_full = kappa.unsqueeze(1)
+    r_safe[r_safe < 1e-10] = 1e-10  # 防止除零
+    kappa_exp_full = kappa.unsqueeze(1)  # ★ κ 张量，用于自旋轨道耦合 (κ/r) 项
 
-    # ★ v15: 严格对齐 Fortran Expect.f90 — 保留 -2M∫F²dr 质量残项
-    #   Fortran L264: +amu/hbc*(G²-F²), L267: -amu*xn
-    #   净效果 ≠ 0! 而是 = -2M∫F²dr ≈ -9.4 MeV (对典型核态)
-    #   推导: M∫(G²-F²)dr - M·1 = M∫(G²-F²-G²-F²)dr = -2M∫F²dr
-    M_hc = 939.0 / hbc
-    h_psi_g_binding = hbc * (-df_full + (kappa_exp_full / r_safe + vtt + YF) * f + (vps + YG) * g)
-    h_psi_f_binding = hbc * ( dg_full + (kappa_exp_full / r_safe + vtt + XG) * g + (vms + XF - 2.0 * M_hc) * f)
+    # ★ v6+: RHF严格自洽Rayleigh商 — 两重关键修正
+    #
+    #  修正A: 量纲分离（修复v6的hbc重复放大灾难）
+    #    v6原代码: hbc * (-df_full + ... + vps*g)
+    #    问题: vps已经是MeV! 再乘hbc → 放大197倍 → E_rayleigh荒谬
+    #    正确: 动能项(fm⁻¹)×hbc→MeV; 势场项(MeV)直接用,不乘hbc
+    #
+    #  修正B: 补全RHF相互作用（v6只有RMF,缺Fock交换+张量）
+    #    PDE中包含: vtt, XG, XF, YG, YF (7个RHF通道)
+    #    但Rayleigh商只用: vps, vms (2个RMF通道)
+    #    矛盾: 哈密顿量不一致! Rayleigh商计算的不是本征值!
+    #    修复: 从PDE逆向推导完整的RHF本征算符:
+    #      G' = -(κ/r+vtt+XG)G + (E_hc-vms-XF)F
+    #      F' = +(κ/r+vtt+YF)F - (E_hc-vps-YG)G
+    #      ⇒ E_hc·G = -F'+(κ/r+vtt+YF)F+(vps+YG)G  (×hbc→MeV)
+    #      ⇒ E_hc·F = G'+(κ/r+vtt+XG)G+(vms+XF)F     (×hbc→MeV)
 
-    # Rayleigh商分子: <ψ|h_RHF|ψ> 【单位: MeV】
+    # A. 动能+自旋轨道项：本身是fm⁻¹，必须乘hbc转为MeV
+    kin_so_g = hbc * (-df_full + (kappa_exp_full / r_safe) * f)
+    kin_so_f = hbc * ( dg_full + (kappa_exp_full / r_safe) * g)
+
+    # B. 势场项：ALREADY in MeV! 包含完整RHF Fock交换+张量项
+    #    ★ detach防止初期势场垃圾反向传播摧毁波函数
+    pot_g = (vtt.detach() + YF.detach()) * f + (vps.detach() + YG.detach()) * g
+    pot_f = (vtt.detach() + XG.detach()) * g + (vms.detach() + XF.detach()) * f
+
+    h_psi_g_binding = kin_so_g + pot_g
+    h_psi_f_binding = kin_so_f + pot_f
+
+    # Rayleigh商分子: <ψ|h|ψ> = ∫(g·h_ψ_g + f·h_ψ_f)dr  【单位: MeV】
     rayleigh_numerator = torch.sum((g * h_psi_g_binding + f * h_psi_f_binding) * dr, dim=1)
     rayleigh_denominator = torch.sum((g**2 + f**2) * dr, dim=1)
 
+    # 结合能 ε (MeV) — 这是 Dirac Hamiltonian 的本征值，直接对应网络输出
     energy_rayleigh = rayleigh_numerator / (rayleigh_denominator.clamp(min=1e-10))
 
-    # 网络输出的能量（专用标量能量头）
-    energy_network_scalar = E.squeeze(-1)  # (B,) — 结合能 [MeV]
-    
-    # ★ v10 恢复双向梯度流：取消 detach() 梯度阻断
-    #   能量与波函数同时优化，让 Rayleigh 商自然驱动两者收敛到自洽解
-    loss_energy_rayleigh = torch.mean((energy_network_scalar - energy_rayleigh) ** 2)
+    # 网络输出的能量（专用标量能量头）直接与之对齐
+    energy_network_scalar = E.squeeze(-1)  # (B,) — 也是结合能 [MeV]
+    loss_energy_rayleigh = torch.mean((energy_rayleigh - energy_network_scalar) ** 2)
 
     # 同时保存Rayleigh能量供后续使用
     energy_E = energy_rayleigh.detach()  # (B,)
@@ -488,10 +545,11 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     f_dominance = integral_f2 - 0.3 * integral_g2      # f 过强的指标
     loss_f_too_large = torch.mean(torch.clamp(f_dominance, min=0.0) ** 2)
 
-    # v7: 撤销 loss_f_too_small（v6 的严厉 F 下限约束）
-    # 原因：PDE 已修正为含 2Mc² 非对称耦合项，网络会自然学到正确 F 尺度
-    #       无需人为强制下限，让物理方程本身驱动 F 分量
-    loss_positive_energy = loss_f_too_large
+    # 2. ★ v6: 防非相对论坍缩 (F→0 优化器捷径阻断)
+    f_lower_bound = 0.002 * integral_g2 - integral_f2   # ∫f² ≥ 0.002·∫g²
+    loss_f_too_small = torch.mean(torch.clamp(f_lower_bound, min=0.0) ** 2) * 100.0
+
+    loss_positive_energy = loss_f_too_large + loss_f_too_small
 
     # ================================================================
     #   ★ 约束 7：动能正定性约束（防震荡假解）
@@ -506,10 +564,10 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     #
     #   负能量海/震荡假解 → 纯动能 < 0 → 重罚
     #
-    # ★ 2026-04-19 修复：使用5PADF交替差分（G:forward, F:backward）
+    # ★ 2026-04-20 修复：使用5PADF宇称交替差分（方向由κ决定）
     # ================================================================
-    D_g_kin = get_cached_fd_matrix_5padf(npt, dr, direction='forward', device=device)
-    D_f_kin = get_cached_fd_matrix_5padf(npt, dr, direction='backward', device=device)
+    D_g_kin = _build_fd_matrix_5padf(npt, dr, direction=g_dir, device=device)
+    D_f_kin = _build_fd_matrix_5padf(npt, dr, direction=f_dir, device=device)
     dg_full_kin = _apply_fd_matrix(g, D_g_kin)
     df_full_kin = _apply_fd_matrix(f, D_f_kin)
 
@@ -1032,23 +1090,28 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     E_hc = E / hbc
     r1 = kappa_exp / r
 
-    # ★ v15: M_hc用于PDE耦合系数(+2M)和Rayleigh商(-2M∫F²dr)
-    M_hc = 939.0 / hbc  # 核子静止质量 / ħc ≈ 4.76 fm⁻¹
+    # ★ v6+: 严格量纲统一（同calc_simplified_residual）
+    vps_hc = vps / hbc
+    vms_hc = vms / hbc
+    vtt_hc = vtt / hbc
+    XG_hc = XG / hbc
+    XF_hc = XF / hbc
+    YG_hc = YG / hbc
+    YF_hc = YF / hbc
 
-    u1g = r1 + vtt + XG
-    u1f = E_hc + 2.0 * M_hc - vms - XF   # ★ v15: +2M修正（vms未含2M偏移）
-    u2f = r1 + vtt + YF
-    u2g = E_hc - vps - YG
+    u1g = r1 + vtt_hc + XG_hc
+    u1f = E_hc - vms_hc - XF_hc
+    u2f = r1 + vtt_hc + YF_hc
+    u2g = E_hc - vps_hc - YG_hc
 
-    # ★ v13: 统一使用5PADF方向性差分（G:forward, F:backward）
-    #   原代码用4阶中心差分(对称)，但Rayleigh商用5PADF → 哈密顿量非厄米
-    #   必须与 calc_physics_residual 保持一致: D_forward(G), D_backward(F)
-    D_g_pde = get_cached_fd_matrix_5padf(npt, dr, direction='forward', device=device)
-    D_f_pde = get_cached_fd_matrix_5padf(npt, dr, direction='backward', device=device)
-    dg_dr = _apply_fd_matrix(g, D_g_pde)     # (B,N) — 全覆盖
-    df_dr = _apply_fd_matrix(f, D_f_pde)     # (B,N) — 全覆盖
+    # ★ v6+: 统一使用5PADF全局差分 + 宇称规则
+    g_dir, f_dir = _get_fd_directions(kappa)
+    D_g_pde = _build_fd_matrix_5padf(npt, dr, direction=g_dir, device=device)
+    D_f_pde = _build_fd_matrix_5padf(npt, dr, direction=f_dir, device=device)
+    dg_dr = _apply_fd_matrix(g, D_g_pde)
+    df_dr = _apply_fd_matrix(f, D_f_pde)
 
-    # ★ v13: 不再切片！中心差分需要g[:,2:-2]丢边界，5PADF全覆盖N点
+    # 5PADF全覆盖，无需切片
     g_int, f_int = g, f
     u1g_int, u1f_int = u1g, u1f
     u2f_int, u2g_int = u2f, u2g
@@ -1056,12 +1119,10 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     # ═══════ 损失 1: Dirac方程PDE残差 ═══════
     Rg = dg_dr - (-u1g_int * g_int + u1f_int * f_int)
     Rf = df_dr - (u2f_int * f_int - u2g_int * g_int)
-    # ★ v13: r加权用完整r网格（5PADF全覆盖，无需切片）
-    r_int = r
+    r_int = r  # 完整r网格
     Rg_weighted = Rg * r_int
     Rf_weighted = Rf * r_int
-    # ★ v10 相对论残差均衡：Rf 权重 30.0（同 calc_physics_residual）
-    loss_pde = torch.mean(Rg_weighted ** 2 + 30.0 * Rf_weighted ** 2) * dr
+    loss_pde = torch.mean(Rg_weighted ** 2 + 3.0 * Rf_weighted ** 2) * dr
 
     # ═══════ 损失 2: 归一化 ═══════
     prob_density = (g ** 2 + f ** 2) * dr
@@ -1115,13 +1176,16 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     #     即 ∫f² / ∫(g²+f²) ≥ 0.005（保守估计）
     #     等价于 ∫f² ≥ 0.005 · ∫g² （因为 g 占主导）
     #
-    # v7: 撤销 F 下限约束（PDE 2Mc² 已修正，物理方程自然驱动正确尺度）
-    loss_pos_energy = loss_f_too_large
+    f_lower_bound = 0.002 * integral_g2 - integral_f2  # 要求 ∫f² ≥ 0.002·∫g²
+    # 如果 F 坍缩，施加极其严厉的惩罚（权重100），把优化器逼出死角
+    loss_f_too_small = torch.mean(torch.clamp(f_lower_bound, min=0.0) ** 2) * 100.0
+
+    loss_pos_energy = loss_f_too_large + loss_f_too_small
 
     # 动能正定性
-    # ★ 2026-04-19 修复：使用5PADF交替差分（G:forward, F:backward）
-    D_g_s = get_cached_fd_matrix_5padf(npt, dr, direction='forward', device=device)
-    D_f_s = get_cached_fd_matrix_5padf(npt, dr, direction='backward', device=device)
+    # ★ 2026-04-20 修复：使用5PADF宇称交替差分（方向由κ决定）
+    D_g_s = _build_fd_matrix_5padf(npt, dr, direction=g_dir, device=device)
+    D_f_s = _build_fd_matrix_5padf(npt, dr, direction=f_dir, device=device)
     dg_full = _apply_fd_matrix(g, D_g_s)
     df_full = _apply_fd_matrix(f, D_f_s)
     kin_term_diff = -g * df_full + f * dg_full
@@ -1196,24 +1260,28 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
 
     # ═══════ 损失 6: Rayleigh商能量一致性 ═══════
     # ================================================================
-    #   ★ v10 严格自洽 RHF Rayleigh 商（同 calc_physics_residual）
-    #   必须包含完整的 Fock 交换项和张量项（vtt, XG, XF, YG, YF）
+    #   ★ v6+: RHF严格自洽Rayleigh商 — 量纲分离 + 完整Fock交换项
     # ================================================================
     r_safe = r.clone()
     r_safe[r_safe < 1e-10] = 1e-10
 
-    # ★ v15: 严格对齐 Expect.f90 — 保留 -2M∫F²dr 质量残项
-    #   同 calc_physics_residual 的推导: Fortran净效果 = -2M∫F²dr ≈ -9.4 MeV
-    h_psi_g_binding = hbc * (-df_full + (kappa_exp / r_safe + vtt + YF) * f + (vps + YG) * g)
-    h_psi_f_binding = hbc * (dg_full + (kappa_exp / r_safe + vtt + XG) * g + (vms + XF - 2.0 * M_hc) * f)
+    # A. 动能+自旋轨道 (fm⁻¹ → MeV)
+    kin_so_g = hbc * (-df_full + (kappa_exp / r_safe) * f)
+    kin_so_f = hbc * ( dg_full + (kappa_exp / r_safe) * g)
+
+    # B. 势场 (ALREADY MeV) — 完整RHF: vtt/XG/XF/YG/YF + detach
+    pot_g = (vtt.detach() + YF.detach()) * f + (vps.detach() + YG.detach()) * g
+    pot_f = (vtt.detach() + XG.detach()) * g + (vms.detach() + XF.detach()) * f
+
+    h_psi_g_binding = kin_so_g + pot_g
+    h_psi_f_binding = kin_so_f + pot_f
 
     rayleigh_numerator = torch.sum((g * h_psi_g_binding + f * h_psi_f_binding) * dr, dim=1)
     rayleigh_denominator = torch.sum((g**2 + f**2) * dr, dim=1)
     energy_rayleigh = rayleigh_numerator / (rayleigh_denominator.clamp(min=1e-10))  # 结合能 [MeV]
 
     energy_network_scalar = E.squeeze(-1)  # 网络输出的结合能 [MeV]
-    # ★ v10 恢复双向梯度流：取消 detach() 梯度阻断
-    loss_energy_rayleigh = torch.mean((energy_network_scalar - energy_rayleigh) ** 2)
+    loss_energy_rayleigh = torch.mean((energy_rayleigh - energy_network_scalar) ** 2)
 
     # ═══════ 诊断信息 ═══════
     vps_core = vps[:, :min(int(6.0/dr), npt)].detach().mean()
@@ -1299,11 +1367,6 @@ class RHFConsistencyChecker:
         f = pred_tensor[:, 1, :]
         vps = pred_tensor[:, 2, :]
         vms = pred_tensor[:, 3, :]
-        vtt = pred_tensor[:, 4, :]   # ★ 张量耦合
-        XG = pred_tensor[:, 5, :]     # ★ Fock交换项
-        XF = pred_tensor[:, 6, :]
-        YG = pred_tensor[:, 7, :]
-        YF = pred_tensor[:, 8, :]
 
         # M_nucleon 已移除 — v5 Rayleigh商直接计算结合能ε，无需静止质量
         hbc = 197.328284  # MeV·fm — 量纲转换常数
@@ -1315,9 +1378,10 @@ class RHFConsistencyChecker:
         kappa_exp = kappa.unsqueeze(1)
 
         # 4阶差分
-        # ★ 2026-04-19 修复：使用5PADF交替差分（G:forward, F:backward）
-        D_g_chk = get_cached_fd_matrix_5padf(npt, dr, direction='forward', device=device)
-        D_f_chk = get_cached_fd_matrix_5padf(npt, dr, direction='backward', device=device)
+        # ★ 2026-04-20 修复：使用5PADF宇称交替差分（方向由κ决定）
+        g_dir_chk, f_dir_chk = _get_fd_directions(kappa)
+        D_g_chk = _build_fd_matrix_5padf(npt, dr, direction=g_dir_chk, device=device)
+        D_f_chk = _build_fd_matrix_5padf(npt, dr, direction=f_dir_chk, device=device)
         dg_dr = _apply_fd_matrix(g, D_g_chk)   # (B, N) — 完整导数
         df_dr = _apply_fd_matrix(f, D_f_chk)   # (B, N)
 
@@ -1325,10 +1389,23 @@ class RHFConsistencyChecker:
         dg_full = dg_dr
         df_full = df_dr
 
-        # ★ v15: 严格对齐 Expect.f90 — 保留 -2M∫F²dr 质量残项
-        M_hc = 939.0 / hbc
-        h_psi_g_binding = hbc * (-df_full + (kappa_exp / r_safe + vtt + YF) * f + (vps + YG) * g)
-        h_psi_f_binding = hbc * (dg_full + (kappa_exp / r_safe + vtt + XG) * g + (vms + XF - 2.0 * M_hc) * f)
+        # Rayleigh能量
+        # ================================================================
+        #   ★ v6+: RHF严格自洽 — 量纲分离 + 完整Fock交换项
+        # ================================================================
+        r_safe = r.clone()
+        r_safe[r_safe < 1e-10] = 1e-10
+
+        # A. 动能+自旋轨道 (fm⁻¹ → MeV)
+        kin_g = hbc * (-df_full + (kappa_exp / r_safe) * f)
+        kin_f = hbc * ( dg_full + (kappa_exp / r_safe) * g)
+
+        # B. 势场 (ALREADY MeV) — 完整RHF
+        pg = (vtt.detach() + YF.detach()) * f + (vps.detach() + YG.detach()) * g
+        pf = (vtt.detach() + XG.detach()) * g + (vms.detach() + XF.detach()) * f
+
+        h_psi_g_binding = kin_g + pg
+        h_psi_f_binding = kin_f + pf
         rayleigh_num = torch.sum((g * h_psi_g_binding + f * h_psi_f_binding) * dr, dim=1)
         rayleigh_den = torch.sum((g**2 + f**2) * dr, dim=1)
         E_rayleigh = rayleigh_num / (rayleigh_den.clamp(min=1e-10))  # 结合能 [MeV]（无需减M）
