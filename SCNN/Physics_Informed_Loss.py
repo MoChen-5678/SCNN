@@ -299,10 +299,8 @@ def calc_physics_residual(pred_tensor, kappa, stats_mean=None, stats_std=None,
     Rg_weighted = Rg * r_int  # 自然压制近核区发散
     Rf_weighted = Rf * r_int
 
-    # ★ v8 相对论残差均衡：
-    #   Rf 物理量级 ~ Rg/20，平方后差 400 倍，3x 权重远远不够
-    #   必须用 (c/v)² ≈ 200 补偿梯度悬殊，否则优化器将 F 归零
-    loss_pde = torch.mean(Rg_weighted ** 2 + 200.0 * Rf_weighted ** 2) * dr
+    # ★ v10 相对论残差均衡：Rf 权重 30.0（安全区，避免高阶差分梯度爆炸）
+    loss_pde = torch.mean(Rg_weighted ** 2 + 30.0 * Rf_weighted ** 2) * dr
 
     # ================================================================
     #   约束 2：狄拉克归一化条件 ∫[g(r)² + f(r)²] dr = 1
@@ -1050,8 +1048,8 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     r_int = r[:, 2:-2]
     Rg_weighted = Rg * r_int
     Rf_weighted = Rf * r_int
-    # ★ v8 相对论残差均衡：Rf 权重 200.0（同 calc_physics_residual）
-    loss_pde = torch.mean(Rg_weighted ** 2 + 200.0 * Rf_weighted ** 2) * dr
+    # ★ v10 相对论残差均衡：Rf 权重 30.0（同 calc_physics_residual）
+    loss_pde = torch.mean(Rg_weighted ** 2 + 30.0 * Rf_weighted ** 2) * dr
 
     # ═══════ 损失 2: 归一化 ═══════
     prob_density = (g ** 2 + f ** 2) * dr
