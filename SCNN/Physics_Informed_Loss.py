@@ -1036,18 +1036,24 @@ def calc_simplified_residual(pred_tensor, kappa, dr=0.10, n_principal=None, y_tr
     u2f = r1 + vtt + YF
     u2g = E_hc - vps - YG
 
-    # 4阶中心差分
-    dg_dr = (-g[:, 4:] + 8.0 * g[:, 3:-1] - 8.0 * g[:, 1:-3] + g[:, :-4]) / (12.0 * dr)
-    df_dr = (-f[:, 4:] + 8.0 * f[:, 3:-1] - 8.0 * f[:, 1:-3] + f[:, :-4]) / (12.0 * dr)
+    # ★ v13: 统一使用5PADF方向性差分（G:forward, F:backward）
+    #   原代码用4阶中心差分(对称)，但Rayleigh商用5PADF → 哈密顿量非厄米
+    #   必须与 calc_physics_residual 保持一致: D_forward(G), D_backward(F)
+    D_g_pde = get_cached_fd_matrix_5padf(npt, dr, direction='forward', device=device)
+    D_f_pde = get_cached_fd_matrix_5padf(npt, dr, direction='backward', device=device)
+    dg_dr = _apply_fd_matrix(g, D_g_pde)     # (B,N) — 全覆盖
+    df_dr = _apply_fd_matrix(f, D_f_pde)     # (B,N) — 全覆盖
 
-    g_int, f_int = g[:, 2:-2], f[:, 2:-2]
-    u1g_int, u1f_int = u1g[:, 2:-2], u1f[:, 2:-2]
-    u2f_int, u2g_int = u2f[:, 2:-2], u2g[:, 2:-2]
+    # ★ v13: 不再切片！中心差分需要g[:,2:-2]丢边界，5PADF全覆盖N点
+    g_int, f_int = g, f
+    u1g_int, u1f_int = u1g, u1f
+    u2f_int, u2g_int = u2f, u2g
 
     # ═══════ 损失 1: Dirac方程PDE残差 ═══════
     Rg = dg_dr - (-u1g_int * g_int + u1f_int * f_int)
     Rf = df_dr - (u2f_int * f_int - u2g_int * g_int)
-    r_int = r[:, 2:-2]
+    # ★ v13: r加权用完整r网格（5PADF全覆盖，无需切片）
+    r_int = r
     Rg_weighted = Rg * r_int
     Rf_weighted = Rf * r_int
     # ★ v10 相对论残差均衡：Rf 权重 30.0（同 calc_physics_residual）
