@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 from dirac_matrix_vs_pinn import scan_pot_files
@@ -137,6 +138,47 @@ def parse_result(output):
     return {"E_pinn": float(match[0]), "dE": float(match[1])}
 
 
+def run_ablation(ablation, idx, total, target, args, output_root):
+    run_dir = os.path.join(output_root, ablation["name"])
+    os.makedirs(run_dir, exist_ok=True)
+    cmd = [
+        sys.executable,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "dirac_matrix_vs_pinn.py"),
+        "--state", target["label"],
+        "--tau", target["tau"],
+        "--A", str(args.A),
+        "--Z", str(args.Z),
+        "--pot-file", target["pot_file"],
+        "--pot-dir", args.pot_dir,
+        "--E-init", str(target["E"]),
+        "--epochs", str(args.epochs),
+        "--lr", str(args.lr),
+        "--output-dir", run_dir,
+        "--no-live-plot",
+        *ablation["args"],
+    ]
+    print(f"\n[{idx}/{total}] {ablation['name']}: {ablation['description']}", flush=True)
+    started = time.time()
+    proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    elapsed = time.time() - started
+    log_path = os.path.join(run_dir, "run.log")
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(proc.stdout)
+
+    parsed = parse_result(proc.stdout)
+    row = {
+        "name": ablation["name"],
+        "description": ablation["description"],
+        "returncode": proc.returncode,
+        "elapsed_s": elapsed,
+        "target": target,
+        "output_dir": run_dir,
+        "log": log_path,
+        **parsed,
+    }
+    return idx, row
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run plan.md ablations through dirac_matrix_vs_pinn.py")
     parser.add_argument("--pot-dir", default="PKA1/208Pb/POT")
@@ -149,6 +191,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--only", nargs="*", default=None, help="Run only selected ablation names")
+    parser.add_argument("--workers", type=int, default=1, help="Number of ablation subprocesses to run in parallel")
     args = parser.parse_args()
 
     lev_dir = args.lev_dir or infer_lev_dir(args.pot_dir)
@@ -161,54 +204,31 @@ def main():
     if not selected:
         raise SystemExit(f"No ablations selected: {args.only}")
 
-    results = []
     vv_text = f" vv={target['vv']:.6f}" if "vv" in target else ""
     print(f"Target: {target['state_name']} tau={target['tau']}{vv_text} E_ref={target['E']:+.6f} MeV")
     print(f"POT: {target['pot_file']}")
     if lev_dir:
         print(f"LEV: {lev_dir}")
     print(f"Output: {output_root}")
+    n_workers = max(1, min(args.workers, len(selected)))
+    print(f"Workers: requested={args.workers} active={n_workers}")
 
-    for idx, ablation in enumerate(selected, 1):
-        run_dir = os.path.join(output_root, ablation["name"])
-        os.makedirs(run_dir, exist_ok=True)
-        cmd = [
-            sys.executable,
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "dirac_matrix_vs_pinn.py"),
-            "--state", target["label"],
-            "--tau", target["tau"],
-            "--A", str(args.A),
-            "--Z", str(args.Z),
-            "--pot-file", target["pot_file"],
-            "--pot-dir", args.pot_dir,
-            "--E-init", str(target["E"]),
-            "--epochs", str(args.epochs),
-            "--lr", str(args.lr),
-            "--output-dir", run_dir,
-            "--no-live-plot",
-            *ablation["args"],
+    results_by_idx = {}
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = [
+            executor.submit(run_ablation, ablation, idx, len(selected), target, args, output_root)
+            for idx, ablation in enumerate(selected, 1)
         ]
-        print(f"\n[{idx}/{len(selected)}] {ablation['name']}: {ablation['description']}")
-        started = time.time()
-        proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        elapsed = time.time() - started
-        log_path = os.path.join(run_dir, "run.log")
-        with open(log_path, "w", encoding="utf-8") as f:
-            f.write(proc.stdout)
-
-        parsed = parse_result(proc.stdout)
-        row = {
-            "name": ablation["name"],
-            "description": ablation["description"],
-            "returncode": proc.returncode,
-            "elapsed_s": elapsed,
-            "target": target,
-            "output_dir": run_dir,
-            "log": log_path,
-            **parsed,
-        }
-        results.append(row)
-        print(f"  rc={proc.returncode} E_PINN={parsed['E_pinn']} dE={parsed['dE']} elapsed={elapsed:.1f}s")
+        for future in as_completed(futures):
+            idx, row = future.result()
+            results_by_idx[idx] = row
+            print(
+                f"  done [{idx}/{len(selected)}] {row['name']}: "
+                f"rc={row['returncode']} E_PINN={row['E_pinn']} dE={row['dE']} "
+                f"elapsed={row['elapsed_s']:.1f}s",
+                flush=True,
+            )
+    results = [results_by_idx[i] for i in sorted(results_by_idx)]
 
     ok = [r for r in results if r["returncode"] == 0 and r["dE"] is not None]
     best = min(ok, key=lambda r: r["dE"]) if ok else None
@@ -217,6 +237,8 @@ def main():
         "target": target,
         "epochs": args.epochs,
         "lr": args.lr,
+        "workers_requested": args.workers,
+        "workers_active": n_workers,
         "best": best,
         "results": results,
     }

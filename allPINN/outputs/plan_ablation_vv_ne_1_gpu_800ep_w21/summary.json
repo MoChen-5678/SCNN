@@ -1,0 +1,183 @@
+{
+  "created_at": "20260514_142510",
+  "target": {
+    "pot_file": "PKA1/208Pb/POT/Pb208_N.4d.5-2_POT.it001.final000.PKA1",
+    "state_name": "N.4d.5/2",
+    "label": "4d5/2",
+    "tau": "n",
+    "E": 1.284169,
+    "occ": 0.666667,
+    "lev_file": "results/PKA1/208Pb/LEV/Pb208.psp-N.PKA1",
+    "index": 16,
+    "mu": 6,
+    "vv": 0.666667,
+    "pot_header_E": 1.284169
+  },
+  "epochs": 800,
+  "lr": 0.001,
+  "workers_requested": 21,
+  "workers_active": 6,
+  "best": {
+    "name": "phase_no_hard_endpoint",
+    "description": "plan items 2-3: phi on, hard G endpoint off",
+    "returncode": 0,
+    "elapsed_s": 82.79075741767883,
+    "target": {
+      "pot_file": "PKA1/208Pb/POT/Pb208_N.4d.5-2_POT.it001.final000.PKA1",
+      "state_name": "N.4d.5/2",
+      "label": "4d5/2",
+      "tau": "n",
+      "E": 1.284169,
+      "occ": 0.666667,
+      "lev_file": "results/PKA1/208Pb/LEV/Pb208.psp-N.PKA1",
+      "index": 16,
+      "mu": 6,
+      "vv": 0.666667,
+      "pot_header_E": 1.284169
+    },
+    "output_dir": "outputs/plan_ablation_vv_ne_1_gpu_800ep_w21/phase_no_hard_endpoint",
+    "log": "outputs/plan_ablation_vv_ne_1_gpu_800ep_w21/phase_no_hard_endpoint/run.log",
+    "E_pinn": 0.161,
+    "dE": 1.1231
+  },
+  "results": [
+    {
+      "name": "baseline",
+      "description": "learn c, no phi, hard G endpoints, soft BC off",
+      "returncode": 0,
+      "elapsed_s": 83.82884049415588,
+      "target": {
+        "pot_file": "PKA1/208Pb/POT/Pb208_N.4d.5-2_POT.it001.final000.PKA1",
+        "state_name": "N.4d.5/2",
+        "label": "4d5/2",
+        "tau": "n",
+        "E": 1.284169,
+        "occ": 0.666667,
+        "lev_file": "results/PKA1/208Pb/LEV/Pb208.psp-N.PKA1",
+        "index": 16,
+        "mu": 6,
+        "vv": 0.666667,
+        "pot_header_E": 1.284169
+      },
+      "output_dir": "outputs/plan_ablation_vv_ne_1_gpu_800ep_w21/baseline",
+      "log": "outputs/plan_ablation_vv_ne_1_gpu_800ep_w21/baseline/run.log",
+      "E_pinn": -4.4475,
+      "dE": 5.7316
+    },
+    {
+      "name": "no_hard_endpoint_no_soft_bc",
+      "description": "plan item 1: hard G endpoint off, soft BC off",
+      "returncode": 0,
+      "elapsed_s": 84.94404149055481,
+      "target": {
+        "pot_file": "PKA1/208Pb/POT/Pb208_N.4d.5-2_POT.it001.final000.PKA1",
+        "state_name": "N.4d.5/2",
+        "label": "4d5/2",
+        "tau": "n",
+        "E": 1.284169,
+        "occ": 0.666667,
+        "lev_file": "results/PKA1/208Pb/LEV/Pb208.psp-N.PKA1",
+        "index": 16,
+        "mu": 6,
+        "vv": 0.666667,
+        "pot_header_E": 1.284169
+      },
+      "output_dir": "outputs/plan_ablation_vv_ne_1_gpu_800ep_w21/no_hard_endpoint_no_soft_bc",
+      "log": "outputs/plan_ablation_vv_ne_1_gpu_800ep_w21/no_hard_endpoint_no_soft_bc/run.log",
+      "E_pinn": -1.6568,
+      "dE": 2.941
+    },
+    {
+      "name": "phase_hard_endpoint",
+      "description": "plan items 2-3: phi on, hard G endpoint on",
+      "returncode": 0,
+      "elapsed_s": 82.17726039886475,
+      "target": {
+        "pot_file": "PKA1/208Pb/POT/Pb208_N.4d.5-2_POT.it001.final000.PKA1",
+        "state_name": "N.4d.5/2",
+        "label": "4d5/2",
+        "tau": "n",
+        "E": 1.284169,
+        "occ": 0.666667,
+        "lev_file": "results/PKA1/208Pb/LEV/Pb208.psp-N.PKA1",
+        "index": 16,
+        "mu": 6,
+        "vv": 0.666667,
+        "pot_header_E": 1.284169
+      },
+      "output_dir": "outputs/plan_ablation_vv_ne_1_gpu_800ep_w21/phase_hard_endpoint",
+      "log": "outputs/plan_ablation_vv_ne_1_gpu_800ep_w21/phase_hard_endpoint/run.log",
+      "E_pinn": -18.0411,
+      "dE": 19.3252
+    },
+    {
+      "name": "phase_no_hard_endpoint",
+      "description": "plan items 2-3: phi on, hard G endpoint off",
+      "returncode": 0,
+      "elapsed_s": 82.79075741767883,
+      "target": {
+        "pot_file": "PKA1/208Pb/POT/Pb208_N.4d.5-2_POT.it001.final000.PKA1",
+        "state_name": "N.4d.5/2",
+        "label": "4d5/2",
+        "tau": "n",
+        "E": 1.284169,
+        "occ": 0.666667,
+        "lev_file": "results/PKA1/208Pb/LEV/Pb208.psp-N.PKA1",
+        "index": 16,
+        "mu": 6,
+        "vv": 0.666667,
+        "pot_header_E": 1.284169
+      },
+      "output_dir": "outputs/plan_ablation_vv_ne_1_gpu_800ep_w21/phase_no_hard_endpoint",
+      "log": "outputs/plan_ablation_vv_ne_1_gpu_800ep_w21/phase_no_hard_endpoint/run.log",
+      "E_pinn": 0.161,
+      "dE": 1.1231
+    },
+    {
+      "name": "phase_constrained",
+      "description": "plan item 4: phi on with cos(k*c*R+phi)=0 constraint",
+      "returncode": 0,
+      "elapsed_s": 86.27021408081055,
+      "target": {
+        "pot_file": "PKA1/208Pb/POT/Pb208_N.4d.5-2_POT.it001.final000.PKA1",
+        "state_name": "N.4d.5/2",
+        "label": "4d5/2",
+        "tau": "n",
+        "E": 1.284169,
+        "occ": 0.666667,
+        "lev_file": "results/PKA1/208Pb/LEV/Pb208.psp-N.PKA1",
+        "index": 16,
+        "mu": 6,
+        "vv": 0.666667,
+        "pot_header_E": 1.284169
+      },
+      "output_dir": "outputs/plan_ablation_vv_ne_1_gpu_800ep_w21/phase_constrained",
+      "log": "outputs/plan_ablation_vv_ne_1_gpu_800ep_w21/phase_constrained/run.log",
+      "E_pinn": -19.347,
+      "dE": 20.6312
+    },
+    {
+      "name": "fixed_c_phase_constrained",
+      "description": "plan item 5: c fixed to 1 with constrained phi",
+      "returncode": 0,
+      "elapsed_s": 85.05335259437561,
+      "target": {
+        "pot_file": "PKA1/208Pb/POT/Pb208_N.4d.5-2_POT.it001.final000.PKA1",
+        "state_name": "N.4d.5/2",
+        "label": "4d5/2",
+        "tau": "n",
+        "E": 1.284169,
+        "occ": 0.666667,
+        "lev_file": "results/PKA1/208Pb/LEV/Pb208.psp-N.PKA1",
+        "index": 16,
+        "mu": 6,
+        "vv": 0.666667,
+        "pot_header_E": 1.284169
+      },
+      "output_dir": "outputs/plan_ablation_vv_ne_1_gpu_800ep_w21/fixed_c_phase_constrained",
+      "log": "outputs/plan_ablation_vv_ne_1_gpu_800ep_w21/fixed_c_phase_constrained/run.log",
+      "E_pinn": -5.5018,
+      "dE": 6.7859
+    }
+  ]
+}
