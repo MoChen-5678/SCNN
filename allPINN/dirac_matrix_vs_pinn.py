@@ -1194,7 +1194,7 @@ def auto_solve_base_state(args, target_state):
         target_state: 目标态 (如 '3s1/2')
     
     返回:
-        base_model_path: 紧邻下一级基态模型路径 (迁移学习用, 已禁用)
+        base_model_path: 紧邻下一级态模型路径 (迁移学习用)
         all_wf_paths: list[str] 所有可能更低n态的波函数路径 (正交惩罚用)
     """
     import re
@@ -1211,6 +1211,8 @@ def auto_solve_base_state(args, target_state):
         return None, []
     
     nucleus = f'{args.A}{args.Z}'
+    if not hasattr(args, '_auto_solved_states'):
+        args._auto_solved_states = set()
     
     # ★ 收集从 n=1 到 n=n_target-1 所有同(l,j)态的波函数路径
     all_wf_paths = []
@@ -1221,7 +1223,9 @@ def auto_solve_base_state(args, target_state):
             f'{nucleus}_{args.tau}_{lower_state.replace("/", "_")}_wavefunction.json',
         )
         
-        if os.path.exists(lower_wf_path):
+        force_lower = getattr(args, 'force_lower', False)
+        solved_this_run = lower_state in args._auto_solved_states
+        if os.path.exists(lower_wf_path) and (not force_lower or solved_this_run):
             print(f'  Found existing: {lower_state} -> {lower_wf_path}')
             all_wf_paths.append(lower_wf_path)
         else:
@@ -1230,8 +1234,12 @@ def auto_solve_base_state(args, target_state):
             print(f'Auto-solving lower state: {lower_state} (for {target_state} orthogonality)')
             print(f'{"="*60}')
             
-            # 先递归确保更低的态都已求解（虽然循环是从n=1往上，但保险起见）
-            auto_solve_base_state(args, lower_state)
+            # 先递归确保更低的同(l,j)态都已求解。
+            # 低激发态也必须使用迁移学习 + 正交约束:
+            #   2d -> load 1d, ortho [1d]
+            #   3d -> load 2d, ortho [1d,2d]
+            #   4d -> load 3d, ortho [1d,2d,3d]
+            lower_base_model_path, lower_ref_paths = auto_solve_base_state(args, lower_state)
             
             lower_pot = find_pot_for_state(args.pot_dir, lower_state, args.tau)
             lower_pot_file = lower_pot['pot_file'] if lower_pot else args.pot_file
@@ -1257,14 +1265,14 @@ def auto_solve_base_state(args, target_state):
                 E_init=lower_E_init,
                 list_states=False,
                 output_dir=args.output_dir,
-                ref_wavefunctions=None,
-                lambda_ortho=0.0,
+                ref_wavefunctions=','.join(lower_ref_paths) if lower_ref_paths else None,
+                lambda_ortho=max(getattr(args, 'lambda_ortho', 10.0), 100.0) if lower_ref_paths else 0.0,
                 save_wavefunction=lower_wf_path,
                 save_model=os.path.join(
                     args.output_dir,
                     f'{nucleus}_{args.tau}_{lower_state.replace("/", "_")}_model.pth',
                 ),
-                load_model=None,
+                load_model=lower_base_model_path if lower_base_model_path and os.path.exists(lower_base_model_path) else None,
                 no_boundary_factor=getattr(args, 'no_boundary_factor', False),
                 no_hard_g_endpoint=getattr(args, 'no_hard_g_endpoint', False),
                 fixed_c=getattr(args, 'fixed_c', False),
@@ -1273,12 +1281,19 @@ def auto_solve_base_state(args, target_state):
                 w_pde=getattr(args, 'w_pde', 20.0),
                 w_bc=getattr(args, 'w_bc', 0.0),
                 no_live_plot=getattr(args, 'no_live_plot', False),
+                force_lower=force_lower,
             )
+
+            if lower_args.ref_wavefunctions:
+                print(f'  Lower-state ortho refs: {lower_args.ref_wavefunctions}')
+            if lower_args.load_model:
+                print(f'  Lower-state transfer model: {lower_args.load_model}')
             
             solve_state(lower_args)
             print(f'\nLower state {lower_state} solved successfully')
             
             if os.path.exists(lower_wf_path):
+                args._auto_solved_states.add(lower_state)
                 all_wf_paths.append(lower_wf_path)
     
     # 紧邻的下一级态模型路径，用于迁移学习热启动
@@ -1612,6 +1627,8 @@ def main():
                         help='相位约束 cos(k*c*R+phi)=0 的损失权重')
     parser.add_argument('--no-live-plot', action='store_true',
                         help='训练时关闭实时绘图')
+    parser.add_argument('--force-lower', action='store_true',
+                        help='重新求解所有自动低态，避免复用旧的低态模型/波函数')
     args = parser.parse_args()
     
     # -- 路径解析：相对路径优先相对于项目根目录 --

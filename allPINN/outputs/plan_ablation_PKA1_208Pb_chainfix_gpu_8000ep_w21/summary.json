@@ -1,0 +1,143 @@
+{
+  "created_at": "20260514_153328",
+  "target": {
+    "pot_file": "PKA1/208Pb/POT/Pb208_N.4d.5-2_POT.it001.final000.PKA1",
+    "state_name": "N.4d.5/2",
+    "label": "4d5/2",
+    "tau": "n",
+    "E": 1.284169,
+    "occ": 0.666667
+  },
+  "epochs": 8000,
+  "lr": 0.001,
+  "workers_requested": 21,
+  "workers_active": 6,
+  "best": {
+    "name": "no_hard_endpoint_no_soft_bc",
+    "description": "plan item 1: hard G endpoint off, soft BC off",
+    "returncode": 0,
+    "elapsed_s": 871.9619159698486,
+    "target": {
+      "pot_file": "PKA1/208Pb/POT/Pb208_N.4d.5-2_POT.it001.final000.PKA1",
+      "state_name": "N.4d.5/2",
+      "label": "4d5/2",
+      "tau": "n",
+      "E": 1.284169,
+      "occ": 0.666667
+    },
+    "output_dir": "outputs/plan_ablation_PKA1_208Pb_chainfix_gpu_8000ep_w21/no_hard_endpoint_no_soft_bc",
+    "log": "outputs/plan_ablation_PKA1_208Pb_chainfix_gpu_8000ep_w21/no_hard_endpoint_no_soft_bc/run.log",
+    "E_pinn": 0.0388,
+    "dE": 1.2454
+  },
+  "results": [
+    {
+      "name": "baseline",
+      "description": "learn c, no phi, hard G endpoints, soft BC off",
+      "returncode": 0,
+      "elapsed_s": 880.1962022781372,
+      "target": {
+        "pot_file": "PKA1/208Pb/POT/Pb208_N.4d.5-2_POT.it001.final000.PKA1",
+        "state_name": "N.4d.5/2",
+        "label": "4d5/2",
+        "tau": "n",
+        "E": 1.284169,
+        "occ": 0.666667
+      },
+      "output_dir": "outputs/plan_ablation_PKA1_208Pb_chainfix_gpu_8000ep_w21/baseline",
+      "log": "outputs/plan_ablation_PKA1_208Pb_chainfix_gpu_8000ep_w21/baseline/run.log",
+      "E_pinn": 0.0189,
+      "dE": 1.2653
+    },
+    {
+      "name": "no_hard_endpoint_no_soft_bc",
+      "description": "plan item 1: hard G endpoint off, soft BC off",
+      "returncode": 0,
+      "elapsed_s": 871.9619159698486,
+      "target": {
+        "pot_file": "PKA1/208Pb/POT/Pb208_N.4d.5-2_POT.it001.final000.PKA1",
+        "state_name": "N.4d.5/2",
+        "label": "4d5/2",
+        "tau": "n",
+        "E": 1.284169,
+        "occ": 0.666667
+      },
+      "output_dir": "outputs/plan_ablation_PKA1_208Pb_chainfix_gpu_8000ep_w21/no_hard_endpoint_no_soft_bc",
+      "log": "outputs/plan_ablation_PKA1_208Pb_chainfix_gpu_8000ep_w21/no_hard_endpoint_no_soft_bc/run.log",
+      "E_pinn": 0.0388,
+      "dE": 1.2454
+    },
+    {
+      "name": "phase_hard_endpoint",
+      "description": "plan items 2-3: phi on, hard G endpoint on",
+      "returncode": 0,
+      "elapsed_s": 865.0707800388336,
+      "target": {
+        "pot_file": "PKA1/208Pb/POT/Pb208_N.4d.5-2_POT.it001.final000.PKA1",
+        "state_name": "N.4d.5/2",
+        "label": "4d5/2",
+        "tau": "n",
+        "E": 1.284169,
+        "occ": 0.666667
+      },
+      "output_dir": "outputs/plan_ablation_PKA1_208Pb_chainfix_gpu_8000ep_w21/phase_hard_endpoint",
+      "log": "outputs/plan_ablation_PKA1_208Pb_chainfix_gpu_8000ep_w21/phase_hard_endpoint/run.log",
+      "E_pinn": -2.2029,
+      "dE": 3.4871
+    },
+    {
+      "name": "phase_no_hard_endpoint",
+      "description": "plan items 2-3: phi on, hard G endpoint off",
+      "returncode": 0,
+      "elapsed_s": 851.9374482631683,
+      "target": {
+        "pot_file": "PKA1/208Pb/POT/Pb208_N.4d.5-2_POT.it001.final000.PKA1",
+        "state_name": "N.4d.5/2",
+        "label": "4d5/2",
+        "tau": "n",
+        "E": 1.284169,
+        "occ": 0.666667
+      },
+      "output_dir": "outputs/plan_ablation_PKA1_208Pb_chainfix_gpu_8000ep_w21/phase_no_hard_endpoint",
+      "log": "outputs/plan_ablation_PKA1_208Pb_chainfix_gpu_8000ep_w21/phase_no_hard_endpoint/run.log",
+      "E_pinn": -0.2218,
+      "dE": 1.506
+    },
+    {
+      "name": "phase_constrained",
+      "description": "plan item 4: phi on with cos(k*c*R+phi)=0 constraint",
+      "returncode": 0,
+      "elapsed_s": 887.9802613258362,
+      "target": {
+        "pot_file": "PKA1/208Pb/POT/Pb208_N.4d.5-2_POT.it001.final000.PKA1",
+        "state_name": "N.4d.5/2",
+        "label": "4d5/2",
+        "tau": "n",
+        "E": 1.284169,
+        "occ": 0.666667
+      },
+      "output_dir": "outputs/plan_ablation_PKA1_208Pb_chainfix_gpu_8000ep_w21/phase_constrained",
+      "log": "outputs/plan_ablation_PKA1_208Pb_chainfix_gpu_8000ep_w21/phase_constrained/run.log",
+      "E_pinn": -2.9406,
+      "dE": 4.2248
+    },
+    {
+      "name": "fixed_c_phase_constrained",
+      "description": "plan item 5: c fixed to 1 with constrained phi",
+      "returncode": 0,
+      "elapsed_s": 883.5787642002106,
+      "target": {
+        "pot_file": "PKA1/208Pb/POT/Pb208_N.4d.5-2_POT.it001.final000.PKA1",
+        "state_name": "N.4d.5/2",
+        "label": "4d5/2",
+        "tau": "n",
+        "E": 1.284169,
+        "occ": 0.666667
+      },
+      "output_dir": "outputs/plan_ablation_PKA1_208Pb_chainfix_gpu_8000ep_w21/fixed_c_phase_constrained",
+      "log": "outputs/plan_ablation_PKA1_208Pb_chainfix_gpu_8000ep_w21/fixed_c_phase_constrained/run.log",
+      "E_pinn": -1.6676,
+      "dE": 2.9517
+    }
+  ]
+}

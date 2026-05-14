@@ -157,6 +157,8 @@ def run_ablation(ablation, idx, total, target, args, output_root):
         "--no-live-plot",
         *ablation["args"],
     ]
+    if args.force_lower:
+        cmd.append("--force-lower")
     print(f"\n[{idx}/{total}] {ablation['name']}: {ablation['description']}", flush=True)
     started = time.time()
     proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -192,6 +194,7 @@ def main():
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--only", nargs="*", default=None, help="Run only selected ablation names")
     parser.add_argument("--workers", type=int, default=1, help="Number of ablation subprocesses to run in parallel")
+    parser.add_argument("--force-lower", action="store_true", help="Recompute automatic lower states instead of reusing existing outputs")
     args = parser.parse_args()
 
     lev_dir = args.lev_dir or infer_lev_dir(args.pot_dir)
