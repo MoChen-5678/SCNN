@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Training products are reproducible and can be large.
+outputs/
+
+# Local reference literature and uploaded figures are not source artifacts.
+*.pdf
+*.png
+*.zip
